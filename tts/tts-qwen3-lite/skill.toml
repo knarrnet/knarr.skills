@@ -1,0 +1,23 @@
+[skill]
+name = "tts-qwen3-lite"
+version = "1.0.0"
+handler = "handler.py:handle"
+description = "TTS via Qwen3-TTS 1.7B. GPU-scheduled Docker. Voice cloning from 3s audio or preset voices (Chelsie, Ethan, Aura, Leo, etc.). OpenAI-compatible API. Returns audio via sidecar."
+tags = ["tts", "voice", "gpu", "docker", "qwen3", "composable"]
+
+[skill.schema]
+input = {text = "string", voice = "string", voice_ref_asset = "string", voice_ref_base64 = "string", voice_ref_text = "string"}
+output = {status = "string", asset_hash = "string", asset_ext = "string", audio_bytes = "string", engine = "string", voice = "string", cloned = "string", gpu_device = "string"}
+
+[skill.pricing]
+price = 5.0
+
+[skill.visibility]
+default = "private"
+
+[dependencies]
+"gpu-scheduler-lite" = {required = true}
+"docker-container-ensure-lite" = {required = true}
+
+[requirements]
+packages = ["requests", "pynvml"]

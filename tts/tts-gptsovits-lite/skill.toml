@@ -1,0 +1,23 @@
+[skill]
+name = "tts-gptsovits-lite"
+version = "1.0.0"
+handler = "handler.py:handle"
+description = "TTS via GPT-SoVITS. GPU-scheduled Docker. Blazing fast (RTF 0.014). Voice cloning required. Best for CJK+EN. Returns audio via sidecar."
+tags = ["tts", "voice", "gpu", "docker", "gptsovits", "composable"]
+
+[skill.schema]
+input = {text = "string", voice_ref_asset = "string", voice_ref_base64 = "string", voice_ref_text = "string", voice_ref_lang = "string", text_lang = "string", speed = "string", temperature = "string"}
+output = {status = "string", asset_hash = "string", asset_ext = "string", audio_bytes = "string", engine = "string", text_lang = "string", cloned = "string", gpu_device = "string"}
+
+[skill.pricing]
+price = 5.0
+
+[skill.visibility]
+default = "private"
+
+[dependencies]
+"gpu-scheduler-lite" = {required = true}
+"docker-container-ensure-lite" = {required = true}
+
+[requirements]
+packages = ["requests", "pynvml"]

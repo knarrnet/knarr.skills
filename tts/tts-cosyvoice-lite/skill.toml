@@ -1,0 +1,23 @@
+[skill]
+name = "tts-cosyvoice-lite"
+version = "1.0.0"
+handler = "handler.py:handle"
+description = "TTS via CosyVoice 3 (Alibaba). GPU-scheduled Docker. Zero-shot voice cloning. Best Chinese + 18 dialect support. Returns audio via sidecar."
+tags = ["tts", "voice", "gpu", "docker", "cosyvoice", "composable"]
+
+[skill.schema]
+input = {text = "string", voice_ref_asset = "string", voice_ref_base64 = "string", voice_ref_text = "string"}
+output = {status = "string", asset_hash = "string", asset_ext = "string", audio_bytes = "string", engine = "string", voice = "string", cloned = "string", gpu_device = "string"}
+
+[skill.pricing]
+price = 5.0
+
+[skill.visibility]
+default = "private"
+
+[dependencies]
+"gpu-scheduler-lite" = {required = true}
+"docker-container-ensure-lite" = {required = true}
+
+[requirements]
+packages = ["requests", "pynvml"]

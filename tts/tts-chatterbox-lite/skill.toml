@@ -1,0 +1,23 @@
+[skill]
+name = "tts-chatterbox-lite"
+version = "1.0.0"
+handler = "handler.py:handle"
+description = "TTS via Chatterbox (Resemble AI). GPU-scheduled Docker. Voice cloning from 10s audio. Emotion control via exaggeration and cfg_weight. Returns audio via sidecar."
+tags = ["tts", "voice", "gpu", "docker", "chatterbox", "composable"]
+
+[skill.schema]
+input = {text = "string", voice = "string", voice_ref_asset = "string", voice_ref_base64 = "string", exaggeration = "string", cfg_weight = "string", temperature = "string"}
+output = {status = "string", asset_hash = "string", asset_ext = "string", audio_bytes = "string", engine = "string", voice = "string", cloned = "string", gpu_device = "string"}
+
+[skill.pricing]
+price = 5.0
+
+[skill.visibility]
+default = "private"
+
+[dependencies]
+"gpu-scheduler-lite" = {required = true}
+"docker-container-ensure-lite" = {required = true}
+
+[requirements]
+packages = ["requests", "pynvml"]

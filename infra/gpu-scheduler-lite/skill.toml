@@ -1,0 +1,19 @@
+[skill]
+name = "gpu-scheduler-lite"
+version = "1.0.0"
+handler = "handler.py:handle"
+description = "GPU scheduler: probe VRAM (pynvml), list running containers, request GPU allocation with automatic balancing, evict idle containers. Actions: status, request, evict."
+tags = ["gpu", "scheduler", "infra", "composable"]
+
+[skill.schema]
+input = {action = "string"}
+output = {status = "string", granted = "string", gpu_device = "string", gpus_json = "string", reason = "string"}
+
+[skill.pricing]
+price = 0.1
+
+[skill.visibility]
+default = "private"
+
+[requirements]
+packages = ["pynvml"]

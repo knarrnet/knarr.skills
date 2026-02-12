@@ -1,0 +1,25 @@
+[skill]
+name = "tts-voice-public-lite"
+version = "1.0.0"
+handler = "handler.py:handle"
+description = "Public TTS: text-to-speech with voice cloning. Routes to best GPU-available engine (Qwen3/Chatterbox/CosyVoice/GPT-SoVITS). Fallback chain."
+tags = ["tts", "voice", "gpu", "public"]
+
+[skill.schema]
+input = {text = "string", engine = "string", voice = "string", voice_ref_asset = "string", voice_ref_base64 = "string", voice_ref_text = "string", fallback = "string"}
+output = {status = "string", asset_hash = "string", asset_ext = "string", audio_bytes = "string", engine = "string", routed_engine = "string", cloned = "string"}
+
+[skill.pricing]
+price = 5.0
+
+[skill.visibility]
+default = "public"
+
+[dependencies]
+"tts-qwen3-lite" = {required = false}
+"tts-chatterbox-lite" = {required = false}
+"tts-cosyvoice-lite" = {required = false}
+"tts-gptsovits-lite" = {required = false}
+
+[requirements]
+packages = ["requests"]
