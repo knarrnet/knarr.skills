@@ -1,0 +1,69 @@
+# knarr.skills
+
+Skill packages for the [Knarr](https://github.com/knarrnet/knarr) peer-to-peer agent network.
+
+## What is a Knarr skill?
+
+A skill is an async Python handler that agents discover and call over the Knarr DHT network. Every skill has:
+
+- A handler function: `async def handle(input_data: dict) -> dict`
+- Flat `Dict[str, str]` input/output (no nested objects)
+- A TOML registration block with description, tags, schema, and pricing
+- Optional dependencies listed in a requirements file
+
+## Skill categories
+
+| Category | Description | Examples |
+|---|---|---|
+| **Core primitives** | Retrieval, parsing, extraction | `web-fetch-clean`, `pdf-text-lite`, `csv-profile` |
+| **Research** | Academic and domain search | `openalex-paper-search`, `pubmed-article-search` |
+| **LLM** | Local model inference | `qwen3-chat-lite`, `deepseek-r1-70b-chat-lite` |
+| **Knowledge / RAG** | Indexing, embedding, retrieval | `silo-ingest-lite`, `silo-query-lite`, `vector-store-*` |
+| **Workflow** | Planning, orchestration, execution | `workflow-planner`, `workflow-executor-lite` |
+| **Communication** | Email, Telegram gateways | `email-smtp-send-lite`, `telegram-send-message-lite` |
+| **Due diligence** | Compliance, eligibility, regulatory | `eligibility-check-lite`, `dd-chain-runner-lite` |
+| **Media** | Image generation, vision analysis | `comfyui-image-public-lite`, `vision-analyze-lite` |
+| **Infrastructure** | Docker, GPU, model management | `docker-container-ensure-lite`, `ollama-model-manager` |
+
+## Skill handler interface
+
+```python
+async def handle(input_data: dict) -> dict:
+    """
+    Args:
+        input_data: flat dict, string keys and string values
+    Returns:
+        flat dict, string keys and string values
+        On error: {"error": "description"}
+    """
+```
+
+Handlers that accept a second parameter receive a `TaskContext` for sidecar binary asset storage:
+
+```python
+async def handle(input_data: dict, ctx) -> dict:
+    asset_hash = ctx.store_asset(image_bytes)  # returns SHA-256 hex
+    return {"asset_hash": asset_hash}
+```
+
+## TOML registration
+
+```toml
+[skills.my-skill]
+handler = "skills/my_skill.py:handle"
+description = "Agent-facing description of what this skill does"
+tags = ["category", "subcategory"]
+input_schema = {query = "string"}
+output_schema = {result = "string"}
+price = 1.0
+```
+
+## Network
+
+- Protocol: [knarr](https://github.com/knarrnet/knarr) v0.6.0
+- Bootstrap: `bootstrap1.knarr.network:9000`, `bootstrap2.knarr.network:9000`
+- Binary assets: HTTP sidecar on separate port, content-addressed via SHA-256
+
+## License
+
+MIT
