@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-from session_infra_utils import runtime_root
+from _cache_runtime import runtime_root
 
 SCHEMA_VERSION = 1
 
