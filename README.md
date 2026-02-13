@@ -23,6 +23,7 @@ knarr.skills/
     tts-gptsovits-lite/         # GPT-SoVITS engine
   infra/                        # Infrastructure primitives
     gpu-scheduler-lite/         # GPU VRAM scheduler
+    skill-cache/                # Local DHT skill cache + mock runtime
 ```
 
 ## Skill categories
@@ -30,7 +31,7 @@ knarr.skills/
 | Category | Directory | Description | Examples |
 |---|---|---|---|
 | **TTS** | [`tts/`](tts/) | Voice synthesis with GPU balancing | `tts-voice-public-lite`, `tts-qwen3-lite` |
-| **Infrastructure** | [`infra/`](infra/) | GPU, Docker, model management | `gpu-scheduler-lite` |
+| **Infrastructure** | [`infra/`](infra/) | GPU, Docker, model management, skill cache | `gpu-scheduler-lite`, `skill-cache` |
 | **Core primitives** | -- | Retrieval, parsing, extraction | `web-fetch-clean`, `pdf-text-lite`, `csv-profile` |
 | **Research** | -- | Academic and domain search | `openalex-paper-search`, `pubmed-article-search` |
 | **LLM** | -- | Local model inference | `qwen3-chat-lite`, `deepseek-r1-70b-chat-lite` |
