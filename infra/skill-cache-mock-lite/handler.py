@@ -78,7 +78,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
         if mode not in ("auto", "replay", "synthetic", "live"):
             raise SkillError(f"Invalid mode '{mode}'. Use: auto, replay, synthetic, live")
 
-        # Validate input_json is parseable
         try:
             input_dict = json.loads(input_json_raw)
         except json.JSONDecodeError:
@@ -158,7 +157,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
                 error_str = str(result.get("error", ""))
 
                 if record_run:
-                    # Reopen writable if we were readonly
                     w_conn = get_conn(readonly=False)
                     try:
                         insert_run(
@@ -178,7 +176,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
                     "latency_ms": str(duration_ms),
                 })
 
-            # Fallback: skill not found anywhere
             return ensure_flat_str_dict({
                 "status": "skill_not_found",
                 "mock_mode": mode,

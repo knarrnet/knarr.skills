@@ -1,0 +1,16 @@
+[skill]
+name = "skill-cache-mock-lite"
+version = "0.1.0"
+handler = "handler.py:handle"
+description = "Mock-execute a cached skill: replay recorded output, generate synthetic from schema, or passthrough to live. For fast chain iteration."
+tags = ["infra", "cache", "mock", "testing", "forge"]
+
+[skill.schema]
+input = {skill = "string", input_json = "string", mode = "string"}
+output = {status = "string", mock_mode = "string", output_json = "string", confidence = "string"}
+
+[skill.pricing]
+price = 0.1
+
+[skill.visibility]
+default = "private"

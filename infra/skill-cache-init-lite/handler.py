@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import SkillError, ensure_flat_str_dict, error_result
-from skill_cache_db import cache_db_path, db_exists, get_conn, ensure_schema, reset_schema, get_schema_version, SCHEMA_VERSION
+from skill_cache_db import (
+    cache_db_path, db_exists, get_conn, ensure_schema,
+    reset_schema, get_schema_version, SCHEMA_VERSION,
+)
 
 
 async def handle(input_data: dict, ctx=None) -> dict:

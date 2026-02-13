@@ -7,7 +7,7 @@ Low-level primitives for GPU management, Docker container lifecycle, and model o
 | Skill | Description |
 |---|---|
 | `gpu-scheduler-lite` | Probe GPU VRAM via pynvml, allocate GPUs with automatic load balancing, evict idle containers |
-| `skill-cache` | Local SQLite cache of all DHT skills: harvest, search, mock execution for fast chain iteration |
+| `skill-cache-*` | Local SQLite cache of all DHT skills: harvest, search, mock execution for fast chain iteration |
 
 ## GPU Scheduler
 
@@ -40,8 +40,19 @@ The skill cache is the foundation for the Forge -- an autonomous skill chain com
 
 ### Install
 
+Each skill is a standalone package. Install individually or use the bundled archive:
+
 ```bash
-knarr skill install infra/skill-cache
+# Individual install (from local clone)
+knarr skill install infra/skill-cache-query-lite
+knarr skill install infra/skill-cache-init-lite
+knarr skill install infra/skill-cache-harvest-lite
+knarr skill install infra/skill-cache-mock-lite
+knarr skill install infra/skill-cache-stats-lite
+
+# Or install the bundled .knarr archive (includes all 5)
+knarr skill install skill-cache-query-lite-0.1.0.knarr
 ```
 
 Zero external dependencies -- stdlib only (sqlite3, json, os).
+All 5 skills share a single SQLite database at `<runtime_root>/skill-cache/cache.db`.

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,7 +27,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
 
         conn = get_conn(readonly=True)
         try:
-            # Total rows
             total_skills = conn.execute("SELECT COUNT(*) FROM skills").fetchone()[0]
             unique_skills = conn.execute("SELECT COUNT(DISTINCT skill_name) FROM skills").fetchone()[0]
             fresh_skills = conn.execute(
@@ -36,7 +34,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
             ).fetchone()[0]
             stale_skills = unique_skills - fresh_skills
 
-            # Demo coverage
             skills_with_demos = conn.execute(
                 """SELECT COUNT(DISTINCT sr.skill_name) FROM skill_runs sr
                    JOIN skills s ON s.skill_name = sr.skill_name
@@ -45,10 +42,8 @@ async def handle(input_data: dict, ctx=None) -> dict:
             skills_without_demos = fresh_skills - skills_with_demos
             coverage_pct = round((skills_with_demos / fresh_skills * 100), 1) if fresh_skills > 0 else 0.0
 
-            # Runs
             total_runs = conn.execute("SELECT COUNT(*) FROM skill_runs").fetchone()[0]
 
-            # Harvest history
             harvest_count = conn.execute("SELECT COUNT(*) FROM harvests").fetchone()[0]
             last_harvest = conn.execute(
                 "SELECT * FROM harvests ORDER BY id DESC LIMIT 1"

@@ -23,7 +23,11 @@ knarr.skills/
     tts-gptsovits-lite/         # GPT-SoVITS engine
   infra/                        # Infrastructure primitives
     gpu-scheduler-lite/         # GPU VRAM scheduler
-    skill-cache/                # Local DHT skill cache + mock runtime
+    skill-cache-init-lite/      # Create/migrate cache DB
+    skill-cache-harvest-lite/   # Harvest skills from DHT
+    skill-cache-query-lite/     # Search cached skills (public)
+    skill-cache-mock-lite/      # Mock execution for chain testing
+    skill-cache-stats-lite/     # Cache health metrics
 ```
 
 ## Skill categories

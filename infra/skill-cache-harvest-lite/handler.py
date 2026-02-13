@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
-from typing import Any, Dict
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import SkillError, ensure_flat_str_dict, error_result, parse_int
-from skill_cache_db import (
-    db_exists, get_conn, ensure_schema, upsert_skill,
-)
+from skill_cache_db import db_exists, get_conn, ensure_schema, upsert_skill
 
 NODE: Any = None
 
@@ -64,7 +61,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
                     seen_pairs.add(pair)
 
                     sheet_dict = skill_sheet.to_dict() if hasattr(skill_sheet, "to_dict") else {}
-                    # Enrich with visibility for local reference
                     sheet_dict["_visibility"] = own_vis.get(name, "public")
 
                     upsert_skill(conn, name, local_node_id, local_host, local_port,

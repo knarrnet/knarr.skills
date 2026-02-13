@@ -1,0 +1,19 @@
+[skill]
+name = "skill-cache-harvest-lite"
+version = "0.1.0"
+handler = "handler.py:handle"
+description = "Walk DHT network, upsert all discovered skills into local cache, mark absent skills stale."
+tags = ["infra", "cache", "harvest", "dht", "forge"]
+
+[skill.schema]
+input = {purge_stale_after = "string"}
+output = {status = "string", harvest_id = "string", total_found = "string", unique_skills = "string", upserted = "string", duration_ms = "string"}
+
+[skill.pricing]
+price = 0.1
+
+[skill.visibility]
+default = "private"
+
+[dependencies]
+"knarr:///infra/skill-cache-init-lite@0.1" = {required = true}

@@ -1,0 +1,20 @@
+[skill]
+name = "skill-cache-query-lite"
+version = "0.1.0"
+handler = "handler.py:handle"
+description = "Search local skill cache by name, tag, text, schema keys, or price. Returns skill metadata with full schemas for chain design."
+tags = ["infra", "cache", "search", "forge", "discovery"]
+
+[skill.schema]
+input = {q = "string", name = "string", tag = "string", has_input = "string", has_output = "string"}
+output = {status = "string", count = "string", skills_json = "string", query_ms = "string"}
+
+[skill.pricing]
+price = 0.5
+
+[skill.visibility]
+default = "public"
+
+[dependencies]
+"knarr:///infra/skill-cache-init-lite@0.1" = {required = true}
+"knarr:///infra/skill-cache-harvest-lite@0.1" = {required = true}

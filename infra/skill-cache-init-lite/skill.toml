@@ -1,0 +1,16 @@
+[skill]
+name = "skill-cache-init-lite"
+version = "0.1.0"
+handler = "handler.py:handle"
+description = "Create/migrate local skill cache SQLite DB. Idempotent. Actions: init, reset, status."
+tags = ["infra", "cache", "forge"]
+
+[skill.schema]
+input = {action = "string"}
+output = {status = "string", db_path = "string", schema_version = "string", action_taken = "string"}
+
+[skill.pricing]
+price = 0.1
+
+[skill.visibility]
+default = "private"

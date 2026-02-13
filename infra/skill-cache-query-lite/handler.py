@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any, List
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import SkillError, ensure_flat_str_dict, error_result, parse_int, to_json_string
@@ -41,7 +41,6 @@ async def _auto_refresh(max_age: int) -> str:
     if time.time() - last < max_age:
         return "fresh"
 
-    # Trigger harvest via call_local
     try:
         await NODE.call_local("skill-cache-harvest-lite", {})
         return "refreshed"
@@ -80,8 +79,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
 
         conn = get_conn(readonly=True)
         try:
-            # Build query: deduplicate by skill_name, pick freshest+cheapest
-            # Use a CTE to get one row per skill_name
             where_clauses = []
             params: List[Any] = []
 
@@ -121,7 +118,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
 
             where_sql = (" AND ".join(where_clauses)) if where_clauses else "1=1"
 
-            # Deduplicated query: one row per skill_name, freshest+cheapest
             sql = f"""
                 WITH ranked AS (
                     SELECT s.*,
@@ -162,7 +158,6 @@ async def handle(input_data: dict, ctx=None) -> dict:
                     "last_seen_at": row["last_seen_at"],
                 })
 
-            # Cache age
             cur2 = conn.execute("SELECT MAX(finished_at) FROM harvests")
             last_harvest = cur2.fetchone()
             cache_age = int(time.time() - (last_harvest[0] if last_harvest and last_harvest[0] else 0))

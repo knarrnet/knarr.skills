@@ -1,0 +1,16 @@
+[skill]
+name = "skill-cache-stats-lite"
+version = "0.1.0"
+handler = "handler.py:handle"
+description = "Skill cache health: total/fresh/stale counts, demo coverage, harvest history, DB size."
+tags = ["infra", "cache", "monitoring", "forge"]
+
+[skill.schema]
+input = {action = "string"}
+output = {status = "string", unique_skills = "string", coverage_pct = "string", last_harvest_at = "string"}
+
+[skill.pricing]
+price = 0.1
+
+[skill.visibility]
+default = "private"
