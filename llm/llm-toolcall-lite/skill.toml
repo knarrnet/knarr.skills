@@ -1,0 +1,19 @@
+[skill]
+name = "llm-toolcall-lite"
+version = "1.0.0"
+handler = "handler.py:handle"
+description = "Serverless LLM inference with tool calling. Send a package: system_prompt, user_input, tool definitions (OpenAI format), and pre-loaded tool data. Runs Ollama tool-call loop internally. Models: qwen3:14b (default), gemma3:12b, llama3.2:3b, deepseek-r1:14b."
+tags = ["llm", "tool-calling", "agent", "compute", "utility"]
+
+[skill.schema]
+input = {system_prompt = "string", user_input = "string", tools_json = "string", tool_data_json = "string", world = "string", model = "string", temperature = "string", max_tokens = "string", max_rounds = "string"}
+output = {status = "string", result = "string", model = "string", rounds = "string", tool_calls_made = "string", wall_time_ms = "string"}
+
+[skill.pricing]
+price = 2.0
+
+[skill.visibility]
+default = "public"
+
+[requirements]
+packages = []

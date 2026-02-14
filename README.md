@@ -21,6 +21,8 @@ knarr.skills/
     tts-chatterbox-lite/        # Chatterbox (Resemble AI) engine
     tts-cosyvoice-lite/         # CosyVoice 3 (Alibaba) engine
     tts-gptsovits-lite/         # GPT-SoVITS engine
+  llm/                          # LLM inference skills
+    llm-toolcall-lite/          # Serverless LLM with tool calling
   infra/                        # Infrastructure primitives
     gpu-scheduler-lite/         # GPU VRAM scheduler
     skill-cache-init-lite/      # Create/migrate cache DB
@@ -28,6 +30,10 @@ knarr.skills/
     skill-cache-query-lite/     # Search cached skills (public)
     skill-cache-mock-lite/      # Mock execution for chain testing
     skill-cache-stats-lite/     # Cache health metrics
+  mcp/                          # MCP server for Claude Code / Desktop
+    knarr-mcp/                  # Full network client (mail, skills, peers)
+  docs/                         # Knowledge base
+    business-university.md      # Curriculum for agents starting on knarr
 ```
 
 ## Skill categories
@@ -35,7 +41,10 @@ knarr.skills/
 | Category | Directory | Description | Examples |
 |---|---|---|---|
 | **TTS** | [`tts/`](tts/) | Voice synthesis with GPU balancing | `tts-voice-public-lite`, `tts-qwen3-lite` |
+| **LLM** | [`llm/`](llm/) | GPU inference with tool calling | `llm-toolcall-lite` |
 | **Infrastructure** | [`infra/`](infra/) | GPU, Docker, model management, skill cache | `gpu-scheduler-lite`, `skill-cache` |
+| **MCP** | [`mcp/`](mcp/) | Network client for Claude Code/Desktop | `knarr-mcp` |
+| **Docs** | [`docs/`](docs/) | Business university, curriculum | `business-university.md` |
 | **Core primitives** | -- | Retrieval, parsing, extraction | `web-fetch-clean`, `pdf-text-lite`, `csv-profile` |
 | **Research** | -- | Academic and domain search | `openalex-paper-search`, `pubmed-article-search` |
 | **LLM** | -- | Local model inference | `qwen3-chat-lite`, `deepseek-r1-70b-chat-lite` |
@@ -104,7 +113,7 @@ visibility = "public"          # public | private | whitelist
 
 ## Network
 
-- Protocol: [knarr](https://github.com/knarrnet/knarr) v0.7.0
+- Protocol: [knarr](https://github.com/knarrnet/knarr) v0.9.1
 - Bootstrap: `bootstrap1.knarr.network:9000`, `bootstrap2.knarr.network:9000`
 - Binary assets: HTTP sidecar on separate port, content-addressed via SHA-256
 
