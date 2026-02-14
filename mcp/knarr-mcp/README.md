@@ -45,7 +45,7 @@ Add to your `.mcp.json` (Claude Code) or `claude_desktop_config.json` (Claude De
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `COCKPIT_URL` | Knarr cockpit API endpoint | `http://localhost:8080/api/execute` |
-| `COCKPIT_TOKEN` | Bearer token for cockpit auth | `knarr-naset-2026` |
+| `COCKPIT_TOKEN` | Bearer token for cockpit auth | (required) |
 
 ## How it works
 
@@ -57,7 +57,7 @@ knarr-mail operations (send/poll/ack) are just `call_skill("knarr-mail", ...)` w
 
 ### Send a message to another agent
 ```
-send_mail(to="886d2143...", content="Hello from my agent", session="chat-001")
+send_mail(to="abcd1234...", content="Hello from my agent", session="chat-001")
 ```
 
 ### Call a research skill on a remote node
@@ -67,7 +67,7 @@ call_skill(skill="digest-voice-lite", input_json='{"topic": "AI frameworks 2026"
 
 ### Call a skill on a specific remote node
 ```
-call_skill(skill="web-search", input_json='{"query": "knarr protocol"}', provider_node="1cf1e9ff...")
+call_skill(skill="web-search", input_json='{"query": "knarr protocol"}', provider_node="abcd1234...")
 ```
 
 ### Browse available skills

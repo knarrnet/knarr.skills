@@ -11,7 +11,7 @@ Config (in .mcp.json or settings):
       "args": ["-3.13", "F:\\knarr_agents\\prod\\knarr-batch1-provider\\mcp\\knarr_mail_mcp.py"],
       "env": {
         "COCKPIT_URL": "http://localhost:8080/api/execute",
-        "COCKPIT_TOKEN": "knarr-naset-2026"
+        "COCKPIT_TOKEN": "your-cockpit-token"
       }
     }
   }
@@ -28,14 +28,12 @@ from fastmcp import FastMCP
 mcp = FastMCP("knarr-mail")
 
 COCKPIT_URL = os.environ.get("COCKPIT_URL", "http://localhost:8080/api/execute")
-COCKPIT_TOKEN = os.environ.get("COCKPIT_TOKEN", "knarr-naset-2026")
+COCKPIT_TOKEN = os.environ.get("COCKPIT_TOKEN", "")
 PEERS_URL = COCKPIT_URL.replace("/api/execute", "/api/peers")
 
-# Known nodes for delivery routing
+# Known nodes for delivery routing (add your frequently-contacted peers here)
 KNOWN_NODES = {
-    "886d2143ab590dbd01fc0fcea6d44a6b9fce43443c6e62f91622fa6f48539c10": {
-        "host": "46.225.111.239", "port": 9100, "name": "knarrbot",
-    },
+    # "node_id_hex": {"host": "1.2.3.4", "port": 9100, "name": "friendly-name"},
 }
 
 
