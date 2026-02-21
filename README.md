@@ -32,6 +32,10 @@ knarr.skills/
     skill-cache-stats-lite/     # Cache health metrics
   mcp/                          # MCP server for Claude Code / Desktop
     knarr-mcp/                  # Full network client (mail, skills, peers)
+  sdk/                          # Skill Development Kit
+    skill_base.py               # Base class — L1 compliance by default
+    README.md                   # Full documentation and examples
+    examples/                   # Reference implementations
   docs/                         # Knowledge base
     business-university.md      # Curriculum for agents starting on knarr
 ```
@@ -44,6 +48,7 @@ knarr.skills/
 | **LLM** | [`llm/`](llm/) | GPU inference with tool calling | `llm-toolcall-lite` |
 | **Infrastructure** | [`infra/`](infra/) | GPU, Docker, model management, skill cache | `gpu-scheduler-lite`, `skill-cache` |
 | **MCP** | [`mcp/`](mcp/) | Network client for Claude Code/Desktop | `knarr-mcp` |
+| **SDK** | [`sdk/`](sdk/) | Skill base class, healthcheck, examples | `skill_base.py` |
 | **Docs** | [`docs/`](docs/) | Business university, curriculum | `business-university.md` |
 | **Core primitives** | -- | Retrieval, parsing, extraction | `web-fetch-clean`, `pdf-text-lite`, `csv-profile` |
 | **Research** | -- | Academic and domain search | `openalex-paper-search`, `pubmed-article-search` |
@@ -78,6 +83,27 @@ knarr skill export my-skill --bundle
 Installation auto-updates `knarr.toml` and hot-reloads the running node (zero downtime).
 
 ## Skill handler interface
+
+### Using SkillBase (recommended)
+
+Inherit from `SkillBase` and implement `run()`. You get healthcheck, input validation, structured errors, and execution timing for free. See [`sdk/`](sdk/) for full documentation.
+
+```python
+from skill_base import SkillBase
+
+class MySkill(SkillBase):
+    name = "my-skill-lite"
+    required_fields = ["query"]
+
+    async def run(self, data):
+        return {"result": do_something(data["query"])}
+
+_skill = MySkill()
+def set_node(node): _skill.set_node(node)
+async def handle(input_data: dict) -> dict: return await _skill.handle(input_data)
+```
+
+### Raw handler (no base class)
 
 ```python
 async def handle(input_data: dict) -> dict:
