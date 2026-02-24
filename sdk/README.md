@@ -13,6 +13,7 @@ The base class for building skills that don't break.
 | **Error reporting** | Structured error codes, not stack traces | Consumers get actionable errors, not tracebacks |
 | **Input validation** | Schema check before `run()` executes | Bad input rejected at the gate |
 | **Execution timing** | Wall time measurement, feeds reputation | Network can rank providers by performance |
+| **Cost tracking** | External API + chain credit costs, auto-injected | Node stores costs in `execution_log`, enables dynamic pricing |
 
 ## What you write
 
@@ -129,6 +130,78 @@ async def handle(input_data: dict) -> dict:
     return await _skill.handle(input_data)
 ```
 
+## Cost tracking (v0.29.0+)
+
+SkillBase automatically tracks and reports costs. The node strips cost fields from the wire response and stores them in `execution_log` for accounting and dynamic pricing.
+
+### Two cost dimensions
+
+| Dimension | What it tracks | How it's recorded |
+|-----------|---------------|-------------------|
+| **ext_cost** | USD costs for external APIs (Gemini tokens, Brave API, etc.) | `self.add_ext_cost(amount, label)` in your `run()` |
+| **knarr_cost** | $KNARR credits consumed by chained sub-skill calls | Automatic — collected by `self.call()` |
+
+### Leaf skill with external cost
+
+```python
+from skill_base import SkillBase
+from gemini_client import call_gemini_with_usage
+
+class SummarySkill(SkillBase):
+    name = "summary-lite"
+    self_cost = 0.05  # declared compute overhead (GPU time, etc.)
+
+    async def run(self, data):
+        text, usage = call_gemini_with_usage(
+            data["gemini_api_key"],
+            "Summarize this text.",
+            data["text"],
+        )
+        self.add_ext_cost(usage["ext_cost_usd"], "gemini-flash")
+        return {"summary": text, "status": "ok"}
+```
+
+### Chain skill (costs bubble automatically)
+
+When you call sub-skills via `self.call()`, their `_cost_ext` and `_cost_knarr` are automatically accumulated. No manual tracking needed for chain costs.
+
+```python
+class PipelineSkill(SkillBase):
+    name = "pipeline-lite"
+    chain = ["embed-batch-lite", "reasoning-task-lite"]
+
+    async def run(self, data):
+        embed = await self.call("embed-batch-lite", {"text": data["text"]})
+        reason = await self.call("reasoning-task-lite", {"prompt": data["question"]})
+        # Chain costs are automatically collected — no add_ext_cost needed
+        return {"embedding": embed["embedding"], "answer": reason["result"]}
+```
+
+### Cost fields in response
+
+SkillBase injects these fields into every response (the node pops them before sending on wire):
+
+| Field | Description |
+|-------|-------------|
+| `_cost_self` | Declared compute overhead (`self_cost`) |
+| `_cost_ext` | Total external API costs (USD) |
+| `_cost_knarr` | Total $KNARR credits consumed by sub-skills |
+| `_cost_total` | Sum of self + ext + knarr |
+| `_cost_chain` | Per-sub-skill cost breakdown (JSON) |
+| `_exec_report` | Execution report — wall time, status per chain step (JSON) |
+
+### Cost projection
+
+Send `{"_cost_report": true}` to any skill to get a pre-execution cost estimate. Chain skills walk their dependencies and collect declared costs.
+
+```
+Request:  {"_cost_report": true}
+Response: {"status": "ok", "skill": "pipeline-lite",
+           "_cost_self": "0.05", "_cost_ext": "0.001",
+           "_cost_knarr": "0.0", "_cost_total": "0.051",
+           "_cost_chain": "{\"embed-batch-lite\": {...}, ...}"}
+```
+
 ## Healthcheck protocol
 
 The `_healthcheck` convention is exactly that — a convention. No protocol changes, no new message types. Any skill receiving `{"_healthcheck": "true"}` in its input should respond with a lightweight probe instead of executing.
@@ -186,6 +259,7 @@ set_node = skill.set_node  # never discovered
 | `chain` | `list[str]` | `[]` | Sub-skill dependencies (for chain healthcheck) |
 | `required_fields` | `list[str]` | `[]` | Input fields validated before `run()` |
 | `call_local_timeout` | `int` | `600000` | Default timeout (ms) for `self.call()` |
+| `self_cost` | `float` | `0.0` | Declared compute overhead in USD (GPU time, etc.) |
 
 | Method | Override? | Description |
 |--------|-----------|-------------|
@@ -195,6 +269,7 @@ set_node = skill.set_node  # never discovered
 | `set_node(node)` | No | Receives the DHTNode instance from the serve script. |
 | `call(skill, input, timeout_ms)` | No | Convenience wrapper for `NODE.call_local()`. |
 | `check_chain()` | No | Pings all `chain` skills. Returns `None` (healthy) or error string. |
+| `add_ext_cost(amount, label)` | No | Record an external API cost in USD. |
 | `node` | No | Property. Access the DHTNode. Raises if `set_node` wasn't called. |
 
 ## Quality Seal levels
@@ -216,10 +291,12 @@ Using `SkillBase` gets you to L1 by default. The remaining levels require infras
 sdk/
   README.md              # This file
   skill_base.py          # The base class
+  gemini_client.py       # Gemini API client with usage tracking
   examples/
     leaf_skill.py        # Minimal leaf skill example
     chain_skill.py       # Chain skill with healthcheck
     ollama_skill.py      # Leaf skill with Ollama dependency
+    gemini_cost_skill.py # Leaf skill with Gemini cost tracking
 ```
 
 ## License

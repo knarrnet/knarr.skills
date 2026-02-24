@@ -2,7 +2,8 @@
 
 Providers write one method: `async def run(self, input_data) -> dict`.
 Everything else is inherited: healthcheck, structured logging, vault
-integration, error reporting, input validation, execution timing.
+integration, error reporting, input validation, execution timing,
+cost tracking (v0.29.0+).
 
 Usage (leaf skill):
 
@@ -55,6 +56,20 @@ Usage (leaf skill with healthcheck probe):
 
         async def run(self, data):
             ...
+
+Usage (leaf skill with external cost tracking):
+
+    from gemini_client import call_gemini_with_usage
+
+    class GeminiSkill(SkillBase):
+        name = "my-gemini-skill"
+        self_cost = 0.1  # declared compute overhead
+
+        async def run(self, data):
+            text, usage = call_gemini_with_usage(
+                data["gemini_api_key"], "system prompt", data["query"])
+            self.add_ext_cost(usage["ext_cost_usd"], "gemini-flash")
+            return {"result": text}
 """
 
 from __future__ import annotations
@@ -75,9 +90,11 @@ class SkillBase:
     chain: List[str] = []               # sub-skills this orchestrator depends on
     required_fields: List[str] = []     # input fields that must be present
     call_local_timeout: int = 600_000   # default timeout for call_local (ms)
+    self_cost: float = 0.0              # declared compute overhead (GPU time, etc.)
 
     def __init__(self):
         self._node: Any = None
+        self._reset_costs()
 
     # -- Node injection (called by serve_batch1.py) --
 
@@ -90,6 +107,19 @@ class SkillBase:
             raise RuntimeError(f"{self.name}: node not initialized (set_node not called)")
         return self._node
 
+    # -- Cost tracking (v0.29.0+) --
+
+    def _reset_costs(self):
+        """Reset per-execution cost accumulators."""
+        self._ext_cost: float = 0.0
+        self._knarr_cost: float = 0.0
+        self._chain_costs: Dict[str, Any] = {}
+        self._chain_reports: List[Dict[str, Any]] = []
+
+    def add_ext_cost(self, amount: float, label: str = ""):
+        """Record an external API cost in USD."""
+        self._ext_cost += amount
+
     # -- Public entry point (registered as handler) --
 
     async def handle(self, input_data: dict) -> dict:
@@ -99,10 +129,17 @@ class SkillBase:
         if input_data.get("_healthcheck"):
             return await self._do_healthcheck()
 
+        # Cost report fast path
+        if input_data.get("_cost_report"):
+            return await self._do_cost_report()
+
         # Input validation
         err = self._validate_input(input_data)
         if err:
             return err
+
+        # Reset per-execution accumulators
+        self._reset_costs()
 
         # Execute with timing and error handling
         start = time.time()
@@ -114,10 +151,18 @@ class SkillBase:
 
         wall_ms = int((time.time() - start) * 1000)
 
-        # Ensure flat str dict and inject timing
+        # Ensure flat str dict and inject timing + cost fields
         if isinstance(result, dict):
             result["_wall_ms"] = str(wall_ms)
             result["_skill"] = self.name
+            result["_cost_self"] = str(self.self_cost)
+            result["_cost_ext"] = str(round(self._ext_cost, 6))
+            result["_cost_knarr"] = str(round(self._knarr_cost, 6))
+            result["_cost_total"] = str(round(self.self_cost + self._ext_cost + self._knarr_cost, 6))
+            if self._chain_costs:
+                result["_cost_chain"] = json.dumps(self._chain_costs)
+            if self._chain_reports:
+                result["_exec_report"] = json.dumps(self._chain_reports)
             return ensure_flat_str_dict(result)
         return result
 
@@ -141,11 +186,34 @@ class SkillBase:
 
     async def call(self, skill_name: str, input_data: dict,
                    timeout_ms: Optional[int] = None) -> dict:
-        """Call a sub-skill via NODE.call_local. Convenience wrapper."""
-        return await self.node.call_local(
+        """Call a sub-skill via NODE.call_local. Collects chain costs."""
+        t0 = time.time()
+        result = await self.node.call_local(
             skill_name, input_data,
             timeout_ms=timeout_ms or self.call_local_timeout,
         )
+        wall_ms = int((time.time() - t0) * 1000)
+
+        if isinstance(result, dict) and result.get("_cost_total"):
+            sub_ext = float(result.get("_cost_ext", 0))
+            sub_knarr = float(result.get("_cost_knarr", 0))
+            self._chain_costs[skill_name] = {
+                "cost_self": float(result.get("_cost_self", 0)),
+                "cost_ext": sub_ext,
+                "cost_knarr": sub_knarr,
+                "cost_total": float(result.get("_cost_total", 0)),
+            }
+            self._ext_cost += sub_ext
+            self._knarr_cost += sub_knarr
+
+        self._chain_reports.append({
+            "skill": skill_name,
+            "wall_ms": wall_ms,
+            "status": result.get("status", "unknown") if isinstance(result, dict) else "unknown",
+            "cost_ext": float(result.get("_cost_ext", 0)) if isinstance(result, dict) else 0,
+            "cost_knarr": float(result.get("_cost_knarr", 0)) if isinstance(result, dict) else 0,
+        })
+        return result
 
     async def check_chain(self) -> Optional[str]:
         """Pre-exec healthcheck: ping all chain dependencies.
@@ -197,6 +265,32 @@ class SkillBase:
                 "error": truncate_text(str(exc), 500),
                 "latency_ms": str(wall_ms),
             }
+
+    async def _do_cost_report(self) -> dict:
+        """Handle _cost_report request. Walk chain and collect declared costs."""
+        chain_costs: Dict[str, Any] = {}
+        for skill in self.chain:
+            try:
+                r = await self.call(skill, {"_cost_report": True}, timeout_ms=15_000)
+                chain_costs[skill] = {
+                    "self_cost": float(r.get("_cost_self", 0)),
+                    "ext_cost": float(r.get("_cost_ext", 0)),
+                    "knarr_cost": float(r.get("_cost_knarr", 0)),
+                }
+            except Exception:
+                chain_costs[skill] = {"error": "unreachable"}
+
+        total_ext = sum(c.get("ext_cost", 0) for c in chain_costs.values() if "error" not in c)
+        total_knarr = sum(c.get("knarr_cost", 0) for c in chain_costs.values() if "error" not in c)
+        return ensure_flat_str_dict({
+            "status": "ok",
+            "skill": self.name,
+            "_cost_self": str(self.self_cost),
+            "_cost_ext": str(round(total_ext, 6)),
+            "_cost_knarr": str(round(total_knarr, 6)),
+            "_cost_total": str(round(self.self_cost + total_ext + total_knarr, 6)),
+            "_cost_chain": json.dumps(chain_costs) if chain_costs else "",
+        })
 
     def _validate_input(self, input_data: dict) -> Optional[dict]:
         """Validate required fields. Returns error_result or None."""
