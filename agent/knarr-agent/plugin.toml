@@ -1,0 +1,121 @@
+name = "knarr-agent"
+version = "0.2.0"
+handler = "handler:AgentPlugin"
+
+# ── How it works ──
+# The agent is a router. It classifies incoming messages and dispatches
+# them to skills. It does not answer questions — it picks the right skill
+# and calls it. Results flow back automatically via knarr-mail.
+#
+# System prompt is assembled from markdown files in prompts/.
+# Edit those files to change agent behavior. No code changes needed.
+#
+# LLM backends: llama_cpp (local, no server), ollama, gemini, static.
+# Default: llama_cpp with Qwen 2.5 1.5B on CPU. No API key. No GPU.
+
+[config]
+enabled = true
+debug = false
+llm_backend = "llama_cpp"           # "llama_cpp" | "ollama" | "gemini" | "static"
+max_llm_calls_per_hour = 60
+event_debounce_seconds = 10
+tick_interval_multiplier = 6        # agent ticks every 6th node tick (~60s)
+
+[config.llama_cpp]
+model_path = "models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+n_gpu_layers = 0                    # 0=CPU only, -1=all GPU
+n_ctx = 2048
+n_threads = 4
+temperature = 0.2
+max_tokens = 512
+
+[config.ollama]
+base_url = "http://localhost:11434"
+model = "qwen3:14b"
+temperature = 0.3
+num_predict = 1500
+num_ctx = 8192
+timeout = 120
+
+[config.gemini]
+model = "gemini-3-flash-preview"
+temperature = 0.3
+max_tokens = 1024
+
+# ── Reactive Events ──
+
+[config.events.mail_received]
+enabled = true
+from_nodes = []                     # empty = accept from all
+ignore_types = ["ack", "delivery"]
+msg_types = []
+
+[config.events.task_completed]
+enabled = true
+skills = []
+statuses = ["failed"]
+
+[config.events.peer_change]
+enabled = false
+
+# ── Scheduled Jobs ──
+
+[config.jobs.task_stats]
+enabled = true
+interval_hours = 6
+window_hours = 24
+prompt = """Execution statistics for the last {window_hours} hours:
+{stats_summary}
+
+Identify anomalies, failing skills, slow trends.
+Respond with JSON: {{"action": "log", "summary": "..."}}"""
+
+[config.jobs.daily_digest]
+enabled = false
+interval_hours = 24
+run_at_utc = 8
+prompt = """Daily node digest:
+Events: {event_count} | Actions: {action_count}
+Skills: {execution_summary}
+
+Write a brief summary. Respond with JSON: {{"action": "log", "summary": "..."}}"""
+
+# ── Prompts (fallback if prompts/ dir is empty) ──
+
+[config.prompts]
+system = """You are a knarr node agent. Route incoming requests to skills.
+Node: {node_id}. Peers: {peer_count}.
+Skills: {skill_inventory}
+Respond with a single JSON object containing an "action" field."""
+
+mail_received = """New mail:
+From: {from_node} | Type: {msg_type} | Session: {session_id}
+
+Message:
+{body}
+
+History:
+{conversation_history}
+
+Classify the intent and pick the best action. Respond with JSON."""
+
+task_completed = """Skill execution completed:
+Skill: {skill_name} | Status: {status} | Wall: {wall_time_ms}ms | Error: {error}
+Recent: {recent_stats}
+
+Respond with JSON: {{"action": "log"|"send_mail", "summary": "..."}}"""
+
+# ── Actions ──
+
+[config.actions]
+allowed = ["send_mail", "log", "ignore", "call_skill", "store_note"]
+allowed_skills = []                 # populated from knarr.toml at runtime
+max_skill_calls_per_hour = 20
+mail_recipients = []
+max_mail_per_hour = 20
+
+[config.operator]
+alert_node = ""
+
+[requirements]
+packages = ["llama-cpp-python"]

@@ -15,21 +15,26 @@ A skill is an async Python handler that agents discover and call over the Knarr 
 
 ```
 knarr.skills/
-  tts/                          # Text-to-speech voice synthesis
-    tts-voice-public-lite/      # Public facade (routes to best engine)
-    tts-qwen3-lite/             # Qwen3-TTS 1.7B engine
-    tts-chatterbox-lite/        # Chatterbox (Resemble AI) engine
-    tts-cosyvoice-lite/         # CosyVoice 3 (Alibaba) engine
-    tts-gptsovits-lite/         # GPT-SoVITS engine
-  llm/                          # LLM inference skills
-    llm-toolcall-lite/          # Serverless LLM with tool calling
-  infra/                        # Infrastructure primitives
-    gpu-scheduler-lite/         # GPU VRAM scheduler
-    skill-cache-init-lite/      # Create/migrate cache DB
-    skill-cache-harvest-lite/   # Harvest skills from DHT
-    skill-cache-query-lite/     # Search cached skills (public)
-    skill-cache-mock-lite/      # Mock execution for chain testing
-    skill-cache-stats-lite/     # Cache health metrics
+  agent/                          # Node-resident autonomous agent
+    knarr-agent/                  # Router agent — classify, dispatch, reply
+  tts/                            # Text-to-speech voice synthesis
+    tts-voice-public-lite/        # Public facade (routes to best engine)
+    tts-qwen3-lite/               # Qwen3-TTS 1.7B engine
+    tts-chatterbox-lite/          # Chatterbox (Resemble AI) engine
+    tts-cosyvoice-lite/           # CosyVoice 3 (Alibaba) engine
+    tts-gptsovits-lite/           # GPT-SoVITS engine
+  llm/                            # LLM inference skills
+    llm-toolcall-lite/            # Serverless LLM with tool calling
+  infra/                          # Infrastructure primitives
+    deploy-knarr-lite/            # Deploy knarr nodes in Docker
+    fleet-provision-hetzner-lite/ # Hetzner VPS fleet provisioning
+    fleet-provision-docker-lite/  # Docker container fleet provisioning
+    gpu-scheduler-lite/           # GPU VRAM scheduler
+    skill-cache-init-lite/        # Create/migrate cache DB
+    skill-cache-harvest-lite/     # Harvest skills from DHT
+    skill-cache-query-lite/       # Search cached skills (public)
+    skill-cache-mock-lite/        # Mock execution for chain testing
+    skill-cache-stats-lite/       # Cache health metrics
   mcp/                          # MCP server for Claude Code / Desktop
     knarr-mcp/                  # Full network client (mail, skills, peers)
   sdk/                          # Skill Development Kit
@@ -44,9 +49,10 @@ knarr.skills/
 
 | Category | Directory | Description | Examples |
 |---|---|---|---|
+| **Agent** | [`agent/`](agent/) | Node-resident autonomous agent | `knarr-agent` |
 | **TTS** | [`tts/`](tts/) | Voice synthesis with GPU balancing | `tts-voice-public-lite`, `tts-qwen3-lite` |
 | **LLM** | [`llm/`](llm/) | GPU inference with tool calling | `llm-toolcall-lite` |
-| **Infrastructure** | [`infra/`](infra/) | GPU, Docker, model management, skill cache | `gpu-scheduler-lite`, `skill-cache` |
+| **Infrastructure** | [`infra/`](infra/) | Deployment, GPU, Docker, fleet, skill cache | `deploy-knarr-lite`, `fleet-provision-*`, `gpu-scheduler-lite` |
 | **MCP** | [`mcp/`](mcp/) | Network client for Claude Code/Desktop | `knarr-mcp` |
 | **SDK** | [`sdk/`](sdk/) | Skill base class, healthcheck, examples | `skill_base.py` |
 | **Docs** | [`docs/`](docs/) | Business university, curriculum | `business-university.md` |
