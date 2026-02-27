@@ -92,7 +92,7 @@ class ThrallAdmin:
                 "name": r[0], "hash": r[1], "pushed_by": r[2],
                 "pushed_at": r[3], "active": bool(r[4]),
             })
-        return {"status": "ok", "prompts": json.dumps(prompts)}
+        return {"status": "ok", "prompts": prompts}
 
     def _get_prompt(self, input_data: dict) -> dict:
         name = input_data.get("name", "triage")

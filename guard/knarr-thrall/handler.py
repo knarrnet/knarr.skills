@@ -158,6 +158,8 @@ class ThrallGuard(PluginHooks):
                 ON thrall_classifications(action);
             CREATE INDEX IF NOT EXISTS idx_tc_ttl
                 ON thrall_classifications(ttl_expires);
+            CREATE INDEX IF NOT EXISTS idx_tc_node_prefix
+                ON thrall_classifications(substr(from_node, 1, 16));
 
             CREATE TABLE IF NOT EXISTS thrall_prompts (
                 name       TEXT PRIMARY KEY,
@@ -344,6 +346,9 @@ class ThrallGuard(PluginHooks):
 
     async def _wake_agent(self, breaker_type: str, target: str, reason: str):
         """Send system mail to own node to wake the agent."""
+        if not self._ctx.send_mail:
+            self._log_event("WAKE_SKIP", target, "send_mail not wired")
+            return
         try:
             await self._ctx.send_mail(
                 to_node=self._ctx.node_id,
@@ -380,6 +385,12 @@ class ThrallGuard(PluginHooks):
         window = self._rate_limit.get(node_prefix, [])
         window.append(time.time())
         self._rate_limit[node_prefix] = window
+        # Cap rate_limit dict size (W-2: unbounded growth from unique node prefixes)
+        if len(self._rate_limit) > _MAX_COUNTER_ENTRIES:
+            oldest = sorted(self._rate_limit,
+                            key=lambda k: max(self._rate_limit[k], default=0))
+            for k in oldest[:len(self._rate_limit) - _MAX_COUNTER_ENTRIES]:
+                del self._rate_limit[k]
 
     # ── Solicited tracking ──
 

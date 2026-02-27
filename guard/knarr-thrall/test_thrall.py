@@ -254,6 +254,25 @@ class TestEmbeddedBackendInferenceLock:
         assert hasattr(thrall.EmbeddedBackend, "_infer_lock")
         assert isinstance(thrall.EmbeddedBackend._infer_lock, type(threading.Lock()))
 
+    def test_load_failed_flag(self):
+        """Q-2: After failed model load, subsequent calls skip retry."""
+        backend = thrall.EmbeddedBackend({"model_path": "/nonexistent/model.gguf"})
+        # Reset state for test isolation
+        original_instance = thrall.EmbeddedBackend._instance
+        original_failed = thrall.EmbeddedBackend._load_failed
+        thrall.EmbeddedBackend._instance = None
+        thrall.EmbeddedBackend._load_failed = False
+        try:
+            with pytest.raises(Exception):
+                backend._ensure_loaded()
+            assert thrall.EmbeddedBackend._load_failed is True
+            # Second call should fail fast without retrying
+            with pytest.raises(RuntimeError, match="previously failed"):
+                backend._ensure_loaded()
+        finally:
+            thrall.EmbeddedBackend._instance = original_instance
+            thrall.EmbeddedBackend._load_failed = original_failed
+
 
 @pytest.mark.asyncio
 class TestTriage:
@@ -695,6 +714,23 @@ class TestBreakerTripping:
             breaker_path = guard._breaker_dir / f"{prefix}.json"
             assert breaker_path.exists()
 
+    @pytest.mark.asyncio
+    async def test_loop_wakes_agent(self, guard, mock_ctx):
+        """Q-4: Loop detection calls send_mail to wake agent."""
+        with patch.object(handler.thrall_mod, "triage", new_callable=AsyncMock) as mock_triage:
+            mock_triage.return_value = {
+                "action": "wake", "reason": "test", "trust_tier": "unknown",
+                "wall_ms": 10, "reasoning": "{}", "prompt_hash": "abc",
+            }
+            for _ in range(3):
+                await guard.on_mail_received("text", UNKNOWN_NODE, OWN_NODE, {"content": "hi"}, "wake_sess")
+
+            assert mock_ctx.send_mail.called
+            wake_call = mock_ctx.send_mail.call_args
+            assert wake_call.kwargs["body"]["type"] == "thrall_breaker"
+            assert wake_call.kwargs["body"]["wake_agent"] is True
+            assert wake_call.kwargs["msg_type"] == "system"
+
     def test_breaker_blocks_message(self, guard, tmp_plugin_dir):
         """Active breaker blocks messages."""
         prefix = guard._safe_prefix(UNKNOWN_NODE)
@@ -799,7 +835,7 @@ class TestAdminModule:
 
         result = await admin.handle({"action": "list"})
         assert result["status"] == "ok"
-        prompts = json.loads(result["prompts"])
+        prompts = result["prompts"]  # W-4 fix: now returns list directly, not JSON string
         assert len(prompts) >= 1
         assert prompts[0]["name"] == "triage"
 

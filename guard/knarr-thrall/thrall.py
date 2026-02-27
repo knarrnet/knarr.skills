@@ -56,6 +56,7 @@ class EmbeddedBackend:
     _instance = None
     _lock = threading.Lock()
     _infer_lock = threading.Lock()  # serialize inference (model is not thread-safe)
+    _load_failed = False  # Q-2: skip retries after failed load (requires restart)
 
     def __init__(self, config: Dict[str, Any]):
         self._model_path = config.get("model_path", "/app/models/gemma3-1b.gguf")
@@ -66,18 +67,26 @@ class EmbeddedBackend:
     def _ensure_loaded(self):
         if EmbeddedBackend._instance is not None:
             return
+        if EmbeddedBackend._load_failed:
+            raise RuntimeError("model load previously failed (restart to retry)")
         with EmbeddedBackend._lock:
             # Double-check after acquiring lock
             if EmbeddedBackend._instance is not None:
                 return
-            from llama_cpp import Llama
-            EmbeddedBackend._instance = Llama(
-                model_path=self._model_path,
-                n_gpu_layers=0,
-                n_ctx=self._n_ctx,
-                n_threads=self._n_threads,
-                verbose=False,
-            )
+            if EmbeddedBackend._load_failed:
+                raise RuntimeError("model load previously failed (restart to retry)")
+            try:
+                from llama_cpp import Llama
+                EmbeddedBackend._instance = Llama(
+                    model_path=self._model_path,
+                    n_gpu_layers=0,
+                    n_ctx=self._n_ctx,
+                    n_threads=self._n_threads,
+                    verbose=False,
+                )
+            except Exception:
+                EmbeddedBackend._load_failed = True
+                raise
 
     def classify(self, system_prompt: str, body_text: str) -> dict:
         """Classify body_text using the given system prompt. Returns raw model output dict.
@@ -135,7 +144,7 @@ class OllamaBackend:
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"ollama {resp.status}")
-            data = json.loads(resp.read())
+            data = json.loads(resp.read(65536))  # W-3: cap response size
 
         content = data.get("message", {}).get("content", "")
         content = content.strip()
