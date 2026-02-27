@@ -1,0 +1,58 @@
+name = "knarr-thrall"
+version = "0.1.0"
+handler = "handler:ThrallGuard"
+
+# ── How it works ──
+# Thrall is an edge classifier. It intercepts inbound mail and skill
+# requests, classifies them using a local model (gemma3:1b, CPU-only),
+# and decides: wake the agent, auto-reply, or drop.
+#
+# It is a guard — not an actor. It does not answer questions or call
+# skills. It triages, records every decision, and breaks loops.
+#
+# Trust tiers skip the LLM for known nodes:
+#   team    → instant wake, zero latency
+#   known   → LLM classifies
+#   unknown → LLM classifies (higher bar for wake)
+#
+# Backend: embedded (llama-cpp-python, CPU-only, no server) or
+#          ollama (external server, GPU optional).
+# Default: embedded with gemma3:1b Q4_K_M GGUF (778MB).
+
+[config]
+enabled = true
+debug = false
+ignore_msg_types = ["ack", "delivery", "system"]
+max_replies_per_hour_per_node = 5
+
+[config.thrall]
+enabled = true
+backend = "embedded"                    # "embedded" | "ollama"
+model_path = "/app/models/gemma3-1b.gguf"
+n_threads = 2                           # match vCPU count
+timeout_seconds = 30
+fallback = "tier"                       # "tier" | "wake" | "drop"
+classification_ttl_days = 30
+loop_threshold = 2                      # per-session reply cap before breaker
+loop_threshold_sessionless = 5          # higher threshold for sessionless traffic
+knock_threshold = 10                    # drops-per-hour before agent alert
+
+[config.thrall.trust_tiers]
+team = []                               # operator's own nodes — instant wake
+known = []                              # trusted peers — LLM classifies
+
+[config.ollama]
+base_url = "http://localhost:11434"
+model = "gemma3:1b"
+timeout = 10
+
+[config.responder]
+# Claude-powered auto-reply (optional, requires claude_code_lite)
+enabled = false
+max_turns = 3
+max_budget_usd = "1.00"
+timeout_seconds = 90
+cost_trip_threshold = "0.50"
+
+[requirements]
+packages = ["llama-cpp-python"]

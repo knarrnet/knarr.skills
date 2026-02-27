@@ -41,6 +41,8 @@ knarr.skills/
     skill_base.py               # Base class — L1 compliance by default
     README.md                   # Full documentation and examples
     examples/                   # Reference implementations
+  guard/                        # Edge classification and gating
+    knarr-thrall/               # Mail triage, loop detection, breakers
   docs/                         # Knowledge base
     business-university.md      # Curriculum for agents starting on knarr
 ```
@@ -49,6 +51,7 @@ knarr.skills/
 
 | Category | Directory | Description | Examples |
 |---|---|---|---|
+| **Guard** | [`guard/`](guard/) | Edge classification, triage, breakers | `knarr-thrall` |
 | **Agent** | [`agent/`](agent/) | Node-resident autonomous agent | `knarr-agent` |
 | **TTS** | [`tts/`](tts/) | Voice synthesis with GPU balancing | `tts-voice-public-lite`, `tts-qwen3-lite` |
 | **LLM** | [`llm/`](llm/) | GPU inference with tool calling | `llm-toolcall-lite` |

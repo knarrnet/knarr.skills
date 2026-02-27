@@ -1,0 +1,24 @@
+FROM knarr-node:latest
+
+# OpenBLAS + OpenMP runtime for CPU BLAS acceleration
+# libgomp1 is needed at runtime by llama.cpp (OpenMP threading)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas-dev libgomp1 build-essential cmake pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+# llama-cpp-python with OpenBLAS backend (CPU only, no CUDA)
+ENV CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS"
+RUN pip install --no-cache-dir llama-cpp-python
+
+# Clean up build-only tools (keep runtime libs: libgomp1, libopenblas, libgfortran5)
+RUN apt-get purge -y build-essential cmake pkg-config && \
+    apt-get -y autoremove --purge \
+      -o APT::AutoRemove::RecommendsImportant=false \
+      -o APT::NeverAutoRemove::="libgomp1" \
+      -o APT::NeverAutoRemove::="libopenblas0-pthread" \
+      -o APT::NeverAutoRemove::="libopenblas0" \
+      -o APT::NeverAutoRemove::="libgfortran5" && \
+    rm -rf /var/lib/apt/lists/*
+
+# Model directory — GGUF mounted at runtime via docker-compose volume
+RUN mkdir -p /app/models
