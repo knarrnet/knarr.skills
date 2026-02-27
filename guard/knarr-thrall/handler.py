@@ -12,6 +12,7 @@ DB: own thrall.db in plugin_dir (synchronous sqlite3, NOT node.db).
     thrall_admin.reload_prompt is called from the event loop via ctx callback.
 """
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -97,14 +98,24 @@ class ThrallGuard(PluginHooks):
         self._classification_ttl_seconds = int(
             thrall_cfg.get("classification_ttl_days", _DEFAULT_TTL_DAYS)) * 86400
 
-        # Breaker directory
+        # Breaker directory + in-memory cache (C-2: avoid disk I/O per message)
         self._breaker_dir = ctx.plugin_dir / "breakers"
+        self._breaker_cache: Dict[str, Tuple[float, Optional[dict]]] = {}  # name → (cached_at, breaker|None)
+        self._breaker_cache_ttl = 30.0  # seconds
 
         # Log file
         self._log_path = ctx.plugin_dir / "thrall.log"
 
         # Pruning timestamp
         self._last_prune = 0.0
+
+        # Shutdown guard: prevents DB writes after close (C-1 fix)
+        self._shutting_down = False
+        self._inflight = 0  # count of in-flight triage calls
+
+        # Batched commits: accumulate INSERTs, commit on tick or threshold (C-3 fix)
+        self._pending_commits = 0
+        self._commit_threshold = 10  # commit every N inserts if tick hasn't fired
 
         # ── Initialize own DB (single connection, event-loop thread only) ──
         self._db_path = ctx.plugin_dir / "thrall.db"
@@ -182,10 +193,12 @@ class ThrallGuard(PluginHooks):
     def _record_classification(self, msg_id: Optional[str], from_node: str,
                                decision: Dict[str, Any],
                                session_id: Optional[str]):
-        """Write classification record to thrall.db. Called from event loop thread."""
+        """Write classification record to thrall.db. Called from event loop thread.
+        Skips write if shutdown is in progress (C-1: shutdown race guard)."""
+        if self._shutting_down:
+            return
         now = time.time()
         ttl = now + self._classification_ttl_seconds
-        # Use sanitized prefix for storage (not raw from_node which is also stored)
         self._db.execute(
             """INSERT INTO thrall_classifications
                (message_id, from_node, tier, action, reasoning, prompt_hash,
@@ -195,7 +208,15 @@ class ThrallGuard(PluginHooks):
              decision["action"], decision.get("reasoning", "")[:2000],
              decision.get("prompt_hash", ""), decision.get("wall_ms", 0),
              session_id, now, ttl))
-        self._db.commit()
+        self._pending_commits += 1
+        if self._pending_commits >= self._commit_threshold:
+            self._flush_commits()
+
+    def _flush_commits(self):
+        """Commit pending DB writes. Called from tick or when threshold reached."""
+        if self._pending_commits > 0 and not self._shutting_down:
+            self._db.commit()
+            self._pending_commits = 0
 
     # ── Logging ──
 
@@ -222,43 +243,63 @@ class ThrallGuard(PluginHooks):
 
     # ── Circuit breakers ──
 
+    def _load_breaker(self, name: str) -> Optional[dict]:
+        """Load a single breaker from disk, checking expiry. Returns dict or None."""
+        path = self._breaker_dir / f"{name}.json"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, FileNotFoundError):
+            return None
+        try:
+            breaker = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+        # Check auto-expire
+        expires_at = breaker.get("expires_at")
+        if expires_at:
+            try:
+                exp_ts = datetime.fromisoformat(expires_at).timestamp()
+                if time.time() > exp_ts:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    self._log_event("BREAKER_EXPIRED", name,
+                                    f"auto-expired after {breaker.get('auto_expire_seconds', '?')}s")
+                    return None
+            except ValueError:
+                pass
+
+        return breaker
+
+    def _get_breaker_cached(self, name: str) -> Optional[dict]:
+        """Get breaker by name with in-memory cache (C-2: avoid disk I/O per message)."""
+        now = time.time()
+        cached = self._breaker_cache.get(name)
+        if cached is not None:
+            cached_at, breaker = cached
+            if now - cached_at < self._breaker_cache_ttl:
+                return breaker
+
+        # Cache miss or stale — read from disk
+        breaker = self._load_breaker(name)
+        self._breaker_cache[name] = (now, breaker)
+        return breaker
+
     def _check_breakers(self, from_node: str) -> Optional[dict]:
-        """Check if any breaker blocks this sender. Returns breaker dict or None."""
+        """Check if any breaker blocks this sender. Returns breaker dict or None.
+        Uses in-memory cache to avoid disk reads on every message (C-2)."""
         if not self._breaker_dir.exists():
             return None
 
-        now = time.time()
         prefix = self._safe_prefix(from_node)
 
         # Check order: global > node-specific
         for name in ("global", prefix):
-            path = self._breaker_dir / f"{name}.json"
-            try:
-                raw = path.read_text(encoding="utf-8")
-            except (OSError, FileNotFoundError):
-                continue
-            try:
-                breaker = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            # Check auto-expire
-            expires_at = breaker.get("expires_at")
-            if expires_at:
-                try:
-                    exp_ts = datetime.fromisoformat(expires_at).timestamp()
-                    if now > exp_ts:
-                        try:
-                            path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        self._log_event("BREAKER_EXPIRED", name,
-                                        f"auto-expired after {breaker.get('auto_expire_seconds', '?')}s")
-                        continue
-                except ValueError:
-                    pass
-
-            return breaker
+            breaker = self._get_breaker_cached(name)
+            if breaker is not None:
+                return breaker
 
         return None
 
@@ -297,6 +338,8 @@ class ThrallGuard(PluginHooks):
             pass
 
         path.write_text(json.dumps(breaker, indent=2), encoding="utf-8")
+        # Invalidate cache for this breaker (C-2)
+        self._breaker_cache.pop(target, None)
         self._log_event("BREAKER_TRIP", target, reason[:200])
 
     async def _wake_agent(self, breaker_type: str, target: str, reason: str):
@@ -460,14 +503,17 @@ class ThrallGuard(PluginHooks):
                 session_id=session_id)
             return
 
-        # Parse body text
+        # Parse body text — handle any shape (str, list, int, None, dict)
         if isinstance(body, str):
             try:
                 body = json.loads(body)
             except (json.JSONDecodeError, TypeError):
                 body = {"content": body}
-        elif body is None:
+        if body is None:
             body = {}
+        if not isinstance(body, dict):
+            # Non-dict JSON (list, number, bool) — wrap it (GPT C-2: remote DoS fix)
+            body = {"content": str(body)}
 
         body_text = body.get("content", body.get("text", ""))
         if not body_text:
@@ -487,15 +533,26 @@ class ThrallGuard(PluginHooks):
 
         # ── Triage ──
         if self._thrall_enabled:
-            decision = await thrall_mod.triage(
-                from_node=from_node,
-                body_text=body_text,
-                msg_type=msg_type or "text",
-                trust_tiers=self._trust_tiers,
-                config=self._thrall_config,
-                log=self._log,
-                active_prompt=self._active_prompt,
-            )
+            if self._shutting_down:
+                return
+
+            self._inflight += 1
+            try:
+                decision = await thrall_mod.triage(
+                    from_node=from_node,
+                    body_text=body_text,
+                    msg_type=msg_type or "text",
+                    trust_tiers=self._trust_tiers,
+                    config=self._thrall_config,
+                    log=self._log,
+                    active_prompt=self._active_prompt,
+                )
+            finally:
+                self._inflight -= 1
+
+            if self._shutting_down:
+                return
+
             action = decision["action"]
 
             self._log_event("TRIAGE", prefix,
@@ -537,6 +594,7 @@ class ThrallGuard(PluginHooks):
                 self._log_event("SKIP_RATE", prefix,
                                 f"rate limit ({self._max_per_hour}/hr)")
                 return
+            self._record_rate(prefix)  # GPT W-1: was never called, rate limiter was dead
 
         else:
             # Thrall disabled — no classification, no loop detection
@@ -555,19 +613,22 @@ class ThrallGuard(PluginHooks):
         if not self._enabled:
             return
 
+        # Flush pending DB commits on every tick (C-3: batched commits)
+        self._flush_commits()
+
         now = time.time()
         if now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
             return
 
-        # Prune expired classification records
+        # Prune expired classification records (prune commit is standalone, not batched)
         deleted = self._db.execute(
             "DELETE FROM thrall_classifications WHERE ttl_expires < ?",
             (now,)).rowcount
-        self._db.commit()
         if deleted:
+            self._db.commit()
             self._log_event("PRUNE", "-", f"removed {deleted} expired classifications")
 
-        # Prune expired breaker files
+        # Prune expired breaker files + invalidate cache
         if self._breaker_dir.exists():
             for path in self._breaker_dir.glob("*.json"):
                 try:
@@ -577,10 +638,13 @@ class ThrallGuard(PluginHooks):
                         exp_ts = datetime.fromisoformat(expires_at).timestamp()
                         if now > exp_ts:
                             path.unlink(missing_ok=True)
+                            self._breaker_cache.pop(path.stem, None)
                             self._log_event("BREAKER_EXPIRED", path.stem,
                                             "pruned on tick")
                 except (json.JSONDecodeError, OSError, ValueError):
                     pass
+        # Clear entire breaker cache on prune tick (refresh from disk)
+        self._breaker_cache.clear()
 
         # Prune stale reply counter entries
         stale_keys = []
@@ -618,6 +682,24 @@ class ThrallGuard(PluginHooks):
     # ── Shutdown ──
 
     async def on_shutdown(self) -> None:
-        if self._enabled:
-            self._db.close()
-            self._log.info("Thrall guard shut down")
+        if not self._enabled:
+            return
+
+        # Signal shutdown — no new triage calls or DB writes accepted
+        self._shutting_down = True
+
+        # Wait for in-flight triage calls to complete (max 15s)
+        for _ in range(150):
+            if self._inflight <= 0:
+                break
+            await asyncio.sleep(0.1)
+
+        # Flush any remaining uncommitted writes
+        if self._pending_commits > 0:
+            try:
+                self._db.commit()
+            except sqlite3.ProgrammingError:
+                pass  # DB already closed somehow
+
+        self._db.close()
+        self._log.info("Thrall guard shut down")

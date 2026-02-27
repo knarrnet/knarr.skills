@@ -55,6 +55,7 @@ class EmbeddedBackend:
     """llama-cpp-python CPU-only backend. Lazy-loaded singleton (model is ~778MB, load once)."""
     _instance = None
     _lock = threading.Lock()
+    _infer_lock = threading.Lock()  # serialize inference (model is not thread-safe)
 
     def __init__(self, config: Dict[str, Any]):
         self._model_path = config.get("model_path", "/app/models/gemma3-1b.gguf")
@@ -79,20 +80,22 @@ class EmbeddedBackend:
             )
 
     def classify(self, system_prompt: str, body_text: str) -> dict:
-        """Classify body_text using the given system prompt. Returns raw model output dict."""
+        """Classify body_text using the given system prompt. Returns raw model output dict.
+        Serialized via _infer_lock — llama-cpp model is NOT thread-safe (GPT C-1)."""
         self._ensure_loaded()
         # gemma3 chat template requires multimodal content format
         def _wrap(text):
             return [{"type": "text", "text": text}]
-        resp = EmbeddedBackend._instance.create_chat_completion(
-            messages=[
-                {"role": "system", "content": _wrap(system_prompt)},
-                {"role": "user", "content": _wrap(body_text)},
-            ],
-            temperature=0.1,
-            max_tokens=self._max_tokens,
-            response_format={"type": "json_object"},
-        )
+        with EmbeddedBackend._infer_lock:
+            resp = EmbeddedBackend._instance.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": _wrap(system_prompt)},
+                    {"role": "user", "content": _wrap(body_text)},
+                ],
+                temperature=0.1,
+                max_tokens=self._max_tokens,
+                response_format={"type": "json_object"},
+            )
         content = resp["choices"][0]["message"]["content"]
         return json.loads(content)
 
