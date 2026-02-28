@@ -23,6 +23,81 @@ TRIGGER → FILTER → [LLM | HOTWIRE] → ACTION
 
 Four primitives. One pipeline. Every feature is a configuration of this pipeline.
 
+## Bus Integration — The Throughput Constraint
+
+The pipeline diagram above starts at TRIGGER. But when thrall connects to an **event bus**,
+the real question is: what reaches the trigger in the first place?
+
+The LLM is a bottleneck. gemma3:1b on 2 vCPU does ~0.3-1 classifications per second. A busy
+bus produces hundreds of events per second. Without pre-filtering, the LLM queue backs up
+in seconds and the thrall is useless.
+
+**Two filter layers, two different speeds:**
+
+```
+BUS ──→ [SUBSCRIPTION FILTER] ──→ thrall receives ──→ [PIPELINE FILTER] ──→ [LLM QUEUE]
+         regex on event type           only matching        trust bypass         ~1-3s per
+         runs on the bus               events               cooldown, cache      inference
+         sub-ms, unlimited             ~10-100/s            hotwire bypass
+         throughput                                         sub-ms
+```
+
+### Layer 1: Subscription filter (bus-side, pre-delivery)
+
+Thrall subscribes to bus events using **regex patterns on event type and fields**. The bus
+evaluates the regex — events that don't match never reach thrall. This is the volume gate.
+
+```toml
+# Recipe subscribes to specific event patterns on the bus
+[trigger]
+type = "on_bus"
+subscribe = "mail\\.inbound\\.(text|offer)"    # regex on event type
+field_match = { "from_node" = "^(?!de2a6068)" } # optional: regex on fields
+```
+
+The subscription filter is elementary — pure regex, evaluated by the bus, not by thrall.
+No DB lookups, no LLM, no state. The bus does the heavy lifting of discarding irrelevant
+events before they cross the process boundary.
+
+**What this means for recipe design:** Every recipe that listens to the bus MUST declare
+a tight subscription pattern. A recipe with `subscribe = ".*"` defeats the purpose — thrall
+would drown. The subscription regex is the recipe's first line of defense.
+
+### Layer 2: Pipeline filter (thrall-side, pre-LLM)
+
+Events that pass the subscription filter enter the pipeline. The FILTER stage (described
+below) runs in-process, sub-millisecond:
+
+- **Trust bypass**: team node → skip LLM entirely (0ms)
+- **Cooldown**: same event type seen recently → drop (flag check)
+- **Cache hit**: same sender + same body hash → reuse previous LLM result
+- **Hotwire match**: regex on envelope fields → skip LLM, go to action
+- **Rate limit**: sender exceeds threshold → fallback action
+
+Only events that pass ALL of these gates enter the LLM queue. The LLM is the last resort,
+not the first.
+
+### Throughput budget
+
+| Stage | Latency | Throughput | What it costs |
+|-------|---------|------------|---------------|
+| Bus subscription regex | <1ms | unlimited (bus-native) | nothing |
+| Pipeline filter (hotwire/cache/cooldown) | <1ms | ~10k/s | CPU microseconds |
+| LLM queue (Semaphore(1)) | 1-3s | 0.3-1/s | model inference |
+| LLM queue overflow | 0ms | unlimited | fallback action (compile) |
+
+**Design rule:** If a recipe can be solved with a hotwire, it MUST be a hotwire. The LLM
+queue is precious capacity — reserve it for genuinely ambiguous content that regex cannot
+classify. Ack detection, spam patterns, team bypass, known-good senders: all hotwires.
+
+### Queue overflow behavior
+
+When the LLM queue is full (Semaphore busy + queue_timeout exceeded), the pipeline falls
+back to the recipe's `fallback_action` — typically `compile` (buffer the message for later
+batch review). No event is silently dropped. The journal records the overflow with
+`eval_type = "fallback"` so the agent can see if the LLM is consistently overloaded and
+needs a faster model, more hotwires, or tighter subscription patterns.
+
 ## Primitives
 
 ### 1. TRIGGER
@@ -34,6 +109,7 @@ present when the trigger fired. Envelope is immutable and flows through every st
 - `on_mail` — inbound message (envelope: from_node, session_id, body, message_type, sidecar_refs, reply_to, headers)
 - `on_tick` — periodic tick (envelope: tick_count, queue_depth, uptime, last_action_ts)
 - `on_log` — log line match (envelope: line, source_file, timestamp, match_groups)
+- `on_bus` — event bus subscription (envelope: event_type, payload fields). **Requires `subscribe` regex pattern** — see Bus Integration above. Without a tight subscription, bus volume will overwhelm the LLM.
 - `on_skill_request` — inbound skill call (envelope: skill_name, caller_node, input_data) [requires core hook]
 - `on_mail_send` — outbound message (envelope: to_node, body, session_id) [requires core hook]
 - `on_action` — fired by a previous ACTION (recursion)
@@ -488,13 +564,16 @@ The entire feature backlog collapses into pipeline configs:
 
 1. **Switchboard core** — pipeline runner, envelope passing, template resolution
 2. **Config loader** — scan dirs, parse TOML, upsert to DB, reload on sentinel
-3. **Filter engine** — cache, flags, context stitch, trust bypass
+3. **Filter engine** — cache, flags, context stitch, trust bypass, hotwire regex
 4. **Context DB** — table, read/write, expiry cleanup
 5. **Dryrun endpoint** — trace without execute
 6. **Migrate v2** — rewrite current mail triage as a pipeline config (backward compat)
+7. **Bus adapter** — `on_bus` trigger type, regex subscription registration, envelope mapping
 
 Steps 1-4 are the runtime. Step 5 is the agent's testing tool. Step 6 proves it works
-by expressing everything thrall v2 does today as a switchboard config.
+by expressing everything thrall v2 does today as a switchboard config. Step 7 connects
+thrall to the event bus — this is where throughput design becomes critical. The subscription
+filter (regex on bus-side) must be working before any recipe uses `on_bus` triggers.
 
 ## Benchmark: The Gardener's Automation
 
@@ -565,6 +644,17 @@ economy summary. Peer keeps consuming, hits hard_block, complains.
 **With switchboard:** Monitor balances on tick. Send proactive warning at soft_limit.
 **Pipeline:** TRIGGER(on_tick, interval=50) → FILTER(query ledger for balance < soft_limit
 AND no warning sent in 24h) → ACTION(mail peer: "balance low", set_flag=warned)
+
+### B9. Bus-Connected Event Triage (subscription filter, 15 min setup)
+**Today:** Not possible — thrall only sees mail and ticks.
+**With bus:** Thrall subscribes to `ledger\.update\..*` events. Regex subscription filter
+discards 99% of bus traffic. Pipeline filter checks cooldown. Only novel balance changes
+reach the LLM for severity classification. Hotwires handle known patterns (routine task
+completions, expected credit flows). LLM only evaluates anomalies.
+**Pipeline:** BUS(`subscribe="ledger\.update\.(sanctions|warning)"`) → FILTER(cooldown 60s,
+hotwire: routine amounts → drop) → LLM(classify severity) → ACTION(compile or wake)
+**Key:** The subscription regex is the first gate. Without it, 100 ledger events/minute
+flood the 0.3-1 msg/sec LLM queue in under 3 seconds.
 
 ### Cost justification
 | Scenario | Setup cost | Weekly saves | Break-even |
