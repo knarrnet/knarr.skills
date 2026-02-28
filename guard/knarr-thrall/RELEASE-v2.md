@@ -6,7 +6,7 @@
 
 > **Installation**: This doc covers *what* thrall does and *why* you want it.
 > For *how to get it running*, see [README.md](README.md) (quick start + config reference)
-> and [knarr-thrall-OPERATOR.md](../../knarr-thrall-OPERATOR.md) (full operator guide for v3/switchboard).
+> and [OPERATOR.md](OPERATOR.md) (full operator guide for v3/switchboard).
 
 ---
 
