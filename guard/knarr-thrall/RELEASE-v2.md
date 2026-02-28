@@ -4,6 +4,10 @@
 **Requires**: knarr >= 0.29.1, llama-cpp-python >= 0.3
 **Model**: gemma3:1b Q4_K_M GGUF (778 MB)
 
+> **Installation**: This doc covers *what* thrall does and *why* you want it.
+> For *how to get it running*, see [README.md](README.md) (quick start + config reference)
+> and [knarr-thrall-OPERATOR.md](../../knarr-thrall-OPERATOR.md) (full operator guide for v3/switchboard).
+
 ---
 
 ## What is thrall?
