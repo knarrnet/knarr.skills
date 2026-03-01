@@ -1,16 +1,17 @@
 """Thrall — edge model triage for inbound mail.
 
-Classification using a local edge model. Two backends:
+Classification using a swappable backend:
   - embedded: llama-cpp-python, CPU-only, no external dependencies (default)
-  - ollama: HTTP call to ollama server (legacy fallback)
+  - ollama: HTTP call to ollama server (local/LAN, zero cost)
+  - openai: any OpenAI-compatible API (metered, cost-budgeted)
 
 Trust tiers:
   team    → instant wake, no LLM call
   known   → LLM classifies
   unknown → LLM classifies (higher bar for wake)
 
-v2: adds reasoning + prompt_hash to triage results, supports prompt DB override,
-    ack detection in default prompt.
+v3: multi-backend via backends.py. Adds openai support, cost tracking,
+    health status. Keeps same triage() API as v2.
 """
 
 import asyncio
@@ -20,9 +21,9 @@ import logging
 import re
 import threading
 import time
-import urllib.error
-import urllib.request
 from typing import Any, Dict, Optional
+
+from backends import ThrallBackend, create_backend
 
 DEFAULT_SYSTEM_PROMPT = """You classify inbound P2P messages. Reply with exactly one JSON object.
 Valid actions: drop, wake, reply.
@@ -49,134 +50,101 @@ def prompt_hash(prompt_text: str) -> str:
     return hashlib.sha256(prompt_text.encode()).hexdigest()[:16]
 
 
-# ── Embedded Backend (llama-cpp-python, CPU-only) ──
+# ── Backend management ──
 
-class EmbeddedBackend:
-    """llama-cpp-python CPU-only backend. Lazy-loaded singleton (model is ~778MB, load once)."""
-    _instance = None
-    _lock = threading.Lock()
-    _infer_lock = threading.Lock()  # serialize inference (model is not thread-safe)
-    _load_failed = False  # Q-2: skip retries after failed load (requires restart)
-
-    def __init__(self, config: Dict[str, Any]):
-        self._model_path = config.get("model_path", "/app/models/gemma3-1b.gguf")
-        self._n_threads = int(config.get("n_threads", 2))
-        self._n_ctx = 1024
-        self._max_tokens = 128
-
-    def _ensure_loaded(self):
-        if EmbeddedBackend._instance is not None:
-            return
-        if EmbeddedBackend._load_failed:
-            raise RuntimeError("model load previously failed (restart to retry)")
-        with EmbeddedBackend._lock:
-            # Double-check after acquiring lock
-            if EmbeddedBackend._instance is not None:
-                return
-            if EmbeddedBackend._load_failed:
-                raise RuntimeError("model load previously failed (restart to retry)")
-            try:
-                from llama_cpp import Llama
-                EmbeddedBackend._instance = Llama(
-                    model_path=self._model_path,
-                    n_gpu_layers=0,
-                    n_ctx=self._n_ctx,
-                    n_threads=self._n_threads,
-                    verbose=False,
-                )
-            except Exception:
-                EmbeddedBackend._load_failed = True
-                raise
-
-    def classify(self, system_prompt: str, body_text: str) -> dict:
-        """Classify body_text using the given system prompt. Returns raw model output dict.
-        Serialized via _infer_lock — llama-cpp model is NOT thread-safe (GPT C-1)."""
-        self._ensure_loaded()
-        # gemma3 chat template requires multimodal content format
-        def _wrap(text):
-            return [{"type": "text", "text": text}]
-        with EmbeddedBackend._infer_lock:
-            resp = EmbeddedBackend._instance.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": _wrap(system_prompt)},
-                    {"role": "user", "content": _wrap(body_text)},
-                ],
-                temperature=0.1,
-                max_tokens=self._max_tokens,
-                response_format={"type": "json_object"},
-            )
-        content = resp["choices"][0]["message"]["content"]
-        return json.loads(content)
-
-
-# ── Ollama Backend (legacy HTTP fallback) ──
-
-class OllamaBackend:
-    """HTTP backend calling ollama /api/chat."""
-    def __init__(self, config: Dict[str, Any]):
-        self._model = config.get("model", "gemma3:1b")
-        self._url = config.get("ollama_url", "http://localhost:11434")
-        self._timeout = int(config.get("timeout_seconds", 10))
-
-    def classify(self, system_prompt: str, body_text: str) -> dict:
-        """Classify body_text using the given system prompt. Returns raw model output dict."""
-        url = f"{self._url}/api/chat"
-        payload = json.dumps({
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": body_text},
-            ],
-            "stream": False,
-            "format": "json",
-            "options": {
-                "num_predict": 128,
-                "num_ctx": 1024,
-                "temperature": 0.1,
-            },
-        }).encode()
-
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"ollama {resp.status}")
-            data = json.loads(resp.read(65536))  # W-3: cap response size
-
-        content = data.get("message", {}).get("content", "")
-        content = content.strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            content = "\n".join(lines).strip()
-
-        return json.loads(content)
-
-
-# ── Backend factory ──
-
-_backend_cache: Optional[Any] = None
+_backend_cache: Optional[ThrallBackend] = None
 _backend_lock = threading.Lock()
 
 
-def _get_backend(config: Dict[str, Any], log: logging.Logger):
+def _get_backend(config: Dict[str, Any], log: logging.Logger) -> ThrallBackend:
+    """Get or create the thrall backend. Thread-safe, lazy-initialized."""
     global _backend_cache
     if _backend_cache is not None:
         return _backend_cache
     with _backend_lock:
         if _backend_cache is not None:
             return _backend_cache
-        backend_name = config.get("backend", "ollama")
-        if backend_name == "embedded":
-            log.info("Thrall: initializing embedded backend (llama-cpp-python)")
-            _backend_cache = EmbeddedBackend(config)
-        else:
-            log.info(f"Thrall: using ollama backend at {config.get('ollama_url', 'localhost')}")
-            _backend_cache = OllamaBackend(config)
+
+        # Migrate legacy config keys to new structure
+        thrall_cfg = _migrate_config(config)
+        _backend_cache = create_backend(thrall_cfg)
+        log.info(f"Thrall: backend={_backend_cache.name} model={_backend_cache.model_name}")
         return _backend_cache
+
+
+def reset_backend():
+    """Force backend re-creation on next call. Used by sentinel reload."""
+    global _backend_cache
+    with _backend_lock:
+        _backend_cache = None
+
+
+def _migrate_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate v2 flat config to v3 backend structure.
+
+    v2: backend="embedded", model_path="...", ollama_url="..."
+    v3: backend="local", local={...}, ollama={...}, openai={...}
+    """
+    backend_name = config.get("backend", "embedded")
+
+    if backend_name == "embedded":
+        # Map "embedded" → "local" for backends.py
+        return {
+            "backend": "local",
+            "local": {
+                "model_path": config.get("model_path", "/app/models/gemma3-1b.gguf"),
+                "n_threads": int(config.get("n_threads", 2)),
+                "n_ctx": int(config.get("n_ctx", 1024)),
+                "max_tokens": int(config.get("max_tokens", 128)),
+            },
+        }
+    elif backend_name == "ollama":
+        return {
+            "backend": "ollama",
+            "ollama": {
+                "url": config.get("ollama_url", "http://localhost:11434"),
+                "model": config.get("model", "gemma3:1b"),
+                "timeout": int(config.get("timeout_seconds", 10)),
+                "temperature": 0.1,
+                "max_tokens": 128,
+                "num_ctx": 1024,
+            },
+        }
+    elif backend_name in ("local", "openai"):
+        # Already v3 format — pass through
+        return config
+    else:
+        # Unknown backend name — try passing through, factory will raise
+        return config
+
+
+def _parse_classify_result(raw_text: str) -> dict:
+    """Parse raw LLM output into a dict with 'action' and 'reason'."""
+    text = raw_text.strip()
+
+    # Strip markdown code fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+
+    # Try direct JSON parse
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict) and "action" in result:
+            return result
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Try to find JSON object in the text
+    match = re.search(r'\{[^{}]*"action"\s*:\s*"[^"]*"[^{}]*\}', text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return {"action": "drop", "reason": f"unparseable LLM output: {text[:80]}"}
 
 
 async def triage(
@@ -196,7 +164,8 @@ async def triage(
     Returns:
         {"action": "drop"|"wake"|"reply", "reason": str,
          "trust_tier": str, "wall_ms": int,
-         "reasoning": str, "prompt_hash": str}
+         "reasoning": str, "prompt_hash": str,
+         "backend": str}
     """
     t0 = time.time()
     sys_prompt = active_prompt or DEFAULT_SYSTEM_PROMPT
@@ -215,6 +184,7 @@ async def triage(
             "wall_ms": wall_ms,
             "reasoning": "team node — no classification",
             "prompt_hash": p_hash,
+            "backend": "bypass",
         }
 
     # ── Call edge model via selected backend ──
@@ -222,10 +192,9 @@ async def triage(
     formatted_prompt = sys_prompt.format(tier=tier)
 
     try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, backend.classify, formatted_prompt, body_text[:800]
-        )
+        # Backend.infer() returns raw text; we parse it here
+        raw_text = await backend.infer(formatted_prompt, body_text[:800])
+        result = _parse_classify_result(raw_text)
         action = result.get("action", "").lower().strip()
         reasoning = json.dumps(result)
 
@@ -249,6 +218,7 @@ async def triage(
         "wall_ms": wall_ms,
         "reasoning": reasoning,
         "prompt_hash": p_hash,
+        "backend": backend.name,
     }
 
 
