@@ -1,78 +1,57 @@
 name = "knarr-thrall"
-version = "0.2.0"
-handler = "handler:ThrallGuard"
-
-# ── How it works ──
-# Thrall is an edge classifier. It intercepts inbound mail and skill
-# requests, classifies them using a swappable LLM backend, and decides:
-# wake the agent, auto-reply, or drop.
-#
-# It is a guard — not an actor. It does not answer questions or call
-# skills. It triages, records every decision, and breaks loops.
-#
-# Trust tiers skip the LLM for known nodes:
-#   team    → instant wake, zero latency
-#   known   → LLM classifies
-#   unknown → LLM classifies (higher bar for wake)
-#
-# Backends: embedded (llama-cpp-python, CPU-only, default),
-#           ollama (HTTP to ollama server), or
-#           openai (any OpenAI-compatible API, cost-budgeted).
+version = "3.2.1"
+handler = "handler:ThrallPlugin"
 
 [config]
 enabled = true
-debug = false
+debug = true
+dry_run = true
 ignore_msg_types = ["ack", "delivery", "system"]
-max_replies_per_hour_per_node = 5
 
 [config.thrall]
 enabled = true
-backend = "embedded"                    # "embedded" | "ollama" | "openai"
-timeout_seconds = 30
-fallback = "tier"                       # "tier" | "wake" | "drop"
-classification_ttl_days = 30
-loop_threshold = 2                      # per-session reply cap before breaker
-loop_threshold_sessionless = 5          # higher threshold for sessionless traffic
-knock_threshold = 10                    # drops-per-hour before agent alert
+cockpit_token = ""                # from vault — required for act/wake actions
+backend = "ollama"             # local | ollama | openai
+queue_timeout = 5.0            # seconds to wait for LLM slot before fallback
 
-# embedded backend (llama-cpp-python, CPU-only, default)
-model_path = "/app/models/gemma3-1b.gguf"
-n_threads = 2                           # match vCPU count
-
-[config.thrall.local]
-model_path = "/app/models/gemma3-1b.gguf"
-n_threads = 2
+# Legacy flat keys kept for backwards compat — handler migrates to [local] on init
+model_path = "/path/to/gguf/model"
+n_threads = 4
 n_ctx = 1024
 max_tokens = 128
 
+[config.thrall.local]
+model_path = "/path/to/gguf/model"
+n_threads = 4
+n_ctx = 1024
+max_tokens = 128
+
+[config.thrall.cascade]
+enabled = true                 # L1 prefilter before L2
+l1_backend = "local"           # backend type for L1 (local = gemma3:1b CPU)
+l1_prompt = "triage-l1"        # prompt file for L1 (binary drop/escalate)
+
 [config.thrall.ollama]
 url = "http://localhost:11434"
-model = "gemma3:1b"
+model = "qwen3:32b"
 temperature = 0.1
-max_tokens = 128
-num_ctx = 1024
-timeout = 10
+max_tokens = 256
+num_ctx = 2048
+timeout = 30
 
 [config.thrall.openai]
-url = "https://api.openai.com/v1"       # or any OpenAI-compatible endpoint
-model = "gpt-4o-mini"
-api_key_vault = "thrall_api_key"        # loaded from vault, never plaintext
+url = "https://generativelanguage.googleapis.com/v1beta"
+model = "gemini-3-flash-preview"
+api_key_vault = "thrall_api_key"
 temperature = 0.1
 max_tokens = 128
 timeout = 10
-cost_budget_daily = 1.0                 # USD, resets midnight UTC. 0 = unlimited
+cost_budget_daily = 1.0        # USD, resets midnight UTC. 0 = unlimited
 
 [config.thrall.trust_tiers]
-team = []                               # operator's own nodes — instant wake
-known = []                              # trusted peers — LLM classifies
+team = []      # 16-char node_id prefixes — team nodes bypass LLM (immediate action)
+known = []     # known nodes get full LLM classification
 
-[config.responder]
-# Claude-powered auto-reply (optional, requires claude_code_lite)
-enabled = false
-max_turns = 3
-max_budget_usd = "1.00"
-timeout_seconds = 90
-cost_trip_threshold = "0.50"
-
-[requirements]
-packages = ["llama-cpp-python"]
+[config.compilation]
+interval_seconds = 3600
+buffer = "mail-digest"

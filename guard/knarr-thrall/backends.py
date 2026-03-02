@@ -156,6 +156,7 @@ class OllamaBackend(ThrallBackend):
             payload = json.dumps({
                 "model": self._model,
                 "stream": False,
+                "think": False,
                 "format": "json",
                 "messages": [
                     {"role": "system", "content": system_prompt},

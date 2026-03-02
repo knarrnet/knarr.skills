@@ -1,0 +1,16 @@
+# Security events — hotwire only, no LLM.
+# Always wakes agent immediately. No batching for security.
+
+mode = "automated"
+
+[trigger]
+type = "on_event"
+event_pattern = "security.*"
+
+[filter]
+cooldown_key = "security-alert"
+cooldown_seconds = 30
+
+[evaluate]
+type = "hotwire"
+default_action = "wake"

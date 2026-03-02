@@ -1,716 +1,671 @@
-"""knarr-thrall: Edge classification guard plugin.
+"""Thrall Switchboard — Main plugin handler.
 
-Intercepts inbound mail via on_mail_received hook. Classifies using a local
-small model (gemma3:1b). Records every decision. Detects loops. Trips granular
-breakers. Wakes the agent when something needs attention.
+Replaces plugins/06-responder. Hooks into on_mail_received and on_tick.
+Runs recipes against events, compiles digests, summons agent when needed.
 
-v2: transparent classification, granular breakers, loop detection, prompt security.
+v3.0: Configurable pipeline engine. TOML recipes. Compilation buffers.
 
-DB: own thrall.db in plugin_dir (synchronous sqlite3, NOT node.db).
-    Single connection shared with thrall_admin via reference (not path).
-    All DB writes happen on the asyncio event loop thread (single-threaded).
-    thrall_admin.reload_prompt is called from the event loop via ctx callback.
+NOTE: Uses absolute imports (not relative) because knarr's PluginLoader
+imports handler.py via spec_from_file_location with the plugin directory
+temporarily on sys.path. Relative imports would fail.
 """
 
 import asyncio
-import importlib
-import importlib.util
 import json
+import logging
+import logging.handlers
 import os
-import sqlite3
 import time
-from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 from knarr.dht.plugins import PluginHooks, PluginContext, NodeHealth
 from knarr.core.models import NodeInfo
 
-# Load thrall classifier from same directory
-_thrall_spec = importlib.util.spec_from_file_location(
-    "thrall", os.path.join(os.path.dirname(__file__), "thrall.py"))
-thrall_mod = importlib.util.module_from_spec(_thrall_spec)
-_thrall_spec.loader.exec_module(thrall_mod)
+from db import ThrallDB
+from evaluate import Evaluator
+from backends import create_backend
+from actions import ActionExecutor
+from engine import PipelineEngine, Envelope
+from loader import load_all
 
-# Load admin module for prompt management
-_admin_spec = importlib.util.spec_from_file_location(
-    "thrall_admin", os.path.join(os.path.dirname(__file__), "thrall_admin.py"))
-thrall_admin_mod = importlib.util.module_from_spec(_admin_spec)
-_admin_spec.loader.exec_module(thrall_admin_mod)
-
-# Defaults
-_DEFAULT_TTL_DAYS = 30
-_DEFAULT_LOOP_THRESHOLD = 2
-_DEFAULT_LOOP_THRESHOLD_SESSIONLESS = 5
-_DEFAULT_KNOCK_THRESHOLD = 10
-_MAX_COUNTER_ENTRIES = 10_000
-_REPLY_WINDOW_SECONDS = 1800  # 30 minutes
-_PRUNE_INTERVAL_SECONDS = 3600  # 1 hour
-_MAX_BODY_PREVIEW = 2000  # max chars from body before json.dumps fallback
+logger = logging.getLogger("thrall")
 
 
-class ThrallGuard(PluginHooks):
+def _setup_file_logging(plugin_dir: str, debug: bool):
+    """Wire thrall.log as the agent-readable trace.
+
+    RotatingFileHandler: 1MB x 3 backups. The agent reads this to observe
+    thrall's decisions and tune recipes/prompts/thresholds.
+    """
+    log_path = os.path.join(plugin_dir, "thrall.log")
+    handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"))
+    # Attach to the root "thrall" logger — all children inherit
+    root = logging.getLogger("thrall")
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+
+
+class ThrallPlugin(PluginHooks):
+    """Knarr plugin — the switchboard.
+
+    Pipeline: TRIGGER → FILTER → EVALUATE → ACTION
+    Every inbound event flows through matching recipes.
+    """
+
     def __init__(self, ctx: PluginContext, config: Dict[str, Any]):
         self._ctx = ctx
         self._config = config
         self._log = ctx.log
+        self._plugin_dir = str(ctx.plugin_dir)
         self._enabled = config.get("enabled", True)
+        self._debug = config.get("debug", False)
+        self._dry_run = config.get("dry_run", False)
+        self._tick_count = 0
+        self._processing = False
 
         if not self._enabled:
-            self._log.info("Thrall guard disabled by config")
+            self._log.info("Thrall switchboard disabled")
             return
 
-        # Thrall triage config
+        # File logging — the agent's observability layer
+        _setup_file_logging(self._plugin_dir, self._debug)
+
+        # Initialize DB
+        db_path = os.path.join(self._plugin_dir, "thrall.db")
+        self.db = ThrallDB(db_path)
+
+        # Initialize evaluator (swappable LLM backend)
         thrall_cfg = config.get("thrall", {})
-        self._thrall_enabled = thrall_cfg.get("enabled", False)
-        self._thrall_config = thrall_cfg
-        self._trust_tiers = thrall_cfg.get("trust_tiers", {})
+        self._current_backend_name = thrall_cfg.get("backend", "local")
 
-        # Ignored message types
-        self._ignore_msg_types: List[str] = config.get(
-            "ignore_msg_types", ["ack", "delivery", "system"])
+        # Migrate flat model_path to local sub-config for backwards compat
+        if "model_path" in thrall_cfg and "local" not in thrall_cfg:
+            thrall_cfg["local"] = {
+                "model_path": thrall_cfg["model_path"],
+                "n_threads": thrall_cfg.get("n_threads", 4),
+                "n_ctx": thrall_cfg.get("n_ctx", 1024),
+                "max_tokens": thrall_cfg.get("max_tokens", 128),
+            }
+        if "backend" not in thrall_cfg:
+            thrall_cfg["backend"] = "local"
 
-        # Rate limiter: {node_prefix: [timestamp, ...]}
-        self._rate_limit: Dict[str, List[float]] = {}
-        self._max_per_hour = int(config.get("max_replies_per_hour_per_node", 5))
+        backend = create_backend(thrall_cfg, vault_get=ctx.vault_get)
+        cost_budget = thrall_cfg.get("openai", {}).get("cost_budget_daily", 0.0)
 
-        # Loop detection
-        self._loop_threshold = int(
-            thrall_cfg.get("loop_threshold", _DEFAULT_LOOP_THRESHOLD))
-        self._loop_threshold_sessionless = int(
-            thrall_cfg.get("loop_threshold_sessionless",
-                           _DEFAULT_LOOP_THRESHOLD_SESSIONLESS))
-        self._knock_threshold = int(
-            thrall_cfg.get("knock_threshold", _DEFAULT_KNOCK_THRESHOLD))
-
-        # Reply counter: OrderedDict for LRU eviction
-        # Key: (session_id_or_default, node_prefix)  Value: [timestamp, ...]
-        self._reply_counter: OrderedDict[Tuple[str, str], List[float]] = OrderedDict()
-
-        # Solicited tracking: set of (node_prefix, session_id) we've sent to
-        # Populated by record_send() — must be called by the responder plugin
-        # when it sends a reply, otherwise _is_solicited always returns False
-        # and all replies use the base threshold.
-        self._solicited_sends: OrderedDict[Tuple[str, str], float] = OrderedDict()
-
-        # Classification TTL
-        self._classification_ttl_seconds = int(
-            thrall_cfg.get("classification_ttl_days", _DEFAULT_TTL_DAYS)) * 86400
-
-        # Breaker directory + in-memory cache (C-2: avoid disk I/O per message)
-        self._breaker_dir = ctx.plugin_dir / "breakers"
-        self._breaker_cache: Dict[str, Tuple[float, Optional[dict]]] = {}  # name → (cached_at, breaker|None)
-        self._breaker_cache_ttl = 30.0  # seconds
-
-        # Log file
-        self._log_path = ctx.plugin_dir / "thrall.log"
-
-        # Pruning timestamp
-        self._last_prune = 0.0
-
-        # Shutdown guard: prevents DB writes after close (C-1 fix)
-        self._shutting_down = False
-        self._inflight = 0  # count of in-flight triage calls
-
-        # Batched commits: accumulate INSERTs, commit on tick or threshold (C-3 fix)
-        self._pending_commits = 0
-        self._commit_threshold = 10  # commit every N inserts if tick hasn't fired
-
-        # ── Initialize own DB (single connection, event-loop thread only) ──
-        self._db_path = ctx.plugin_dir / "thrall.db"
-        self._db = sqlite3.connect(str(self._db_path))
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._init_tables()
-
-        # Load active prompt from DB (or use default)
-        self._active_prompt = self._load_active_prompt()
-        self._active_prompt_hash = thrall_mod.prompt_hash(self._active_prompt)
-
-        # Share DB connection with admin module (same thread, same connection)
-        thrall_admin_mod.init(self._db, guard=self)
-
-        self._log.info(
-            f"Thrall guard initialized: backend={thrall_cfg.get('backend', 'ollama')}, "
-            f"prompt_hash={self._active_prompt_hash}, "
-            f"loop_threshold={self._loop_threshold}/{self._loop_threshold_sessionless}")
-
-    # ── DB setup ──
-
-    def _init_tables(self):
-        self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS thrall_classifications (
-                rowid         INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id    TEXT,
-                from_node     TEXT NOT NULL,
-                tier          TEXT NOT NULL,
-                action        TEXT NOT NULL,
-                reasoning     TEXT,
-                prompt_hash   TEXT,
-                wall_ms       INTEGER,
-                session_id    TEXT,
-                created_at    REAL NOT NULL,
-                ttl_expires   REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_tc_node
-                ON thrall_classifications(from_node);
-            CREATE INDEX IF NOT EXISTS idx_tc_action
-                ON thrall_classifications(action);
-            CREATE INDEX IF NOT EXISTS idx_tc_ttl
-                ON thrall_classifications(ttl_expires);
-            CREATE INDEX IF NOT EXISTS idx_tc_node_prefix
-                ON thrall_classifications(substr(from_node, 1, 16));
-
-            CREATE TABLE IF NOT EXISTS thrall_prompts (
-                name       TEXT PRIMARY KEY,
-                content    TEXT NOT NULL,
-                hash       TEXT NOT NULL,
-                pushed_by  TEXT NOT NULL,
-                pushed_at  REAL NOT NULL,
-                active     INTEGER DEFAULT 1
-            );
-        """)
-
-        # Insert default prompt if not exists
-        default_hash = thrall_mod.prompt_hash(thrall_mod.DEFAULT_SYSTEM_PROMPT)
-        self._db.execute(
-            """INSERT OR IGNORE INTO thrall_prompts
-               (name, content, hash, pushed_by, pushed_at, active)
-               VALUES (?, ?, ?, ?, ?, 1)""",
-            ("triage", thrall_mod.DEFAULT_SYSTEM_PROMPT, default_hash,
-             "hardcoded", time.time()))
-        self._db.commit()
-
-    def _load_active_prompt(self) -> str:
-        """Load active triage prompt from DB. Falls back to hardcoded default."""
-        row = self._db.execute(
-            "SELECT content FROM thrall_prompts WHERE name = 'triage' AND active = 1"
-        ).fetchone()
-        if row:
-            return row[0]
-        return thrall_mod.DEFAULT_SYSTEM_PROMPT
-
-    # ── Classification records ──
-
-    def _record_classification(self, msg_id: Optional[str], from_node: str,
-                               decision: Dict[str, Any],
-                               session_id: Optional[str]):
-        """Write classification record to thrall.db. Called from event loop thread.
-        Skips write if shutdown is in progress (C-1: shutdown race guard)."""
-        if self._shutting_down:
-            return
-        now = time.time()
-        ttl = now + self._classification_ttl_seconds
-        self._db.execute(
-            """INSERT INTO thrall_classifications
-               (message_id, from_node, tier, action, reasoning, prompt_hash,
-                wall_ms, session_id, created_at, ttl_expires)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (msg_id, from_node, decision.get("trust_tier", "unknown"),
-             decision["action"], decision.get("reasoning", "")[:2000],
-             decision.get("prompt_hash", ""), decision.get("wall_ms", 0),
-             session_id, now, ttl))
-        self._pending_commits += 1
-        if self._pending_commits >= self._commit_threshold:
-            self._flush_commits()
-
-    def _flush_commits(self):
-        """Commit pending DB writes. Called from tick or when threshold reached."""
-        if self._pending_commits > 0 and not self._shutting_down:
-            self._db.commit()
-            self._pending_commits = 0
-
-    # ── Logging ──
-
-    def _log_event(self, action: str, node_prefix: str, detail: str = ""):
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        # Sanitize: strip newlines from prefix and detail to prevent log injection
-        safe_prefix = node_prefix.replace("\n", "").replace("\r", "")[:16]
-        safe_detail = detail.replace("\n", " ").replace("\r", "")[:500]
-        line = f"{ts} [{action}] {safe_prefix} {safe_detail}\n"
-        try:
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(line)
-        except OSError:
-            pass
-        if self._config.get("debug", False):
-            self._log.debug(f"Thrall: [{action}] {safe_prefix} {safe_detail}")
-
-    # ── Node ID validation ──
-
-    @staticmethod
-    def _safe_prefix(from_node: str) -> str:
-        """Extract validated hex prefix from node ID. Returns 'invalid' for bad IDs."""
-        return thrall_mod.sanitize_node_prefix(from_node)
-
-    # ── Circuit breakers ──
-
-    def _load_breaker(self, name: str) -> Optional[dict]:
-        """Load a single breaker from disk, checking expiry. Returns dict or None."""
-        path = self._breaker_dir / f"{name}.json"
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except (OSError, FileNotFoundError):
-            return None
-        try:
-            breaker = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-
-        # Check auto-expire
-        expires_at = breaker.get("expires_at")
-        if expires_at:
+        # Cascade L1 prefilter — optional fast binary filter
+        cascade_cfg = thrall_cfg.get("cascade", {})
+        l1_backend = None
+        self._cascade_enabled = cascade_cfg.get("enabled", False)
+        self._cascade_l1_type = cascade_cfg.get("l1_backend", "")
+        if self._cascade_enabled and self._cascade_l1_type:
             try:
-                exp_ts = datetime.fromisoformat(expires_at).timestamp()
-                if time.time() > exp_ts:
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    self._log_event("BREAKER_EXPIRED", name,
-                                    f"auto-expired after {breaker.get('auto_expire_seconds', '?')}s")
-                    return None
-            except ValueError:
+                l1_cfg = dict(thrall_cfg)
+                l1_cfg["backend"] = self._cascade_l1_type
+                l1_backend = create_backend(l1_cfg, vault_get=ctx.vault_get)
+                self._log.info(f"Cascade L1: {l1_backend.name}/{l1_backend.model_name}")
+            except Exception as e:
+                self._log.warning(f"Cascade L1 init failed: {e} — running without cascade")
+
+        self.evaluator = Evaluator(
+            backend=backend,
+            queue_timeout=thrall_cfg.get("queue_timeout", 5.0),
+            cost_budget_daily=float(cost_budget),
+            l1_backend=l1_backend,
+            l1_prompt=cascade_cfg.get("l1_prompt", "triage-l1"),
+        )
+
+        # Initialize action executor
+        self.actions = ActionExecutor(
+            db=self.db,
+            send_mail_fn=self._send_mail,
+            call_skill_fn=self._call_skill,
+            summon_fn=self._summon_agent,
+            plugin_dir=self._plugin_dir,
+        )
+
+        # Initialize engine
+        self.engine = PipelineEngine(
+            db=self.db,
+            evaluator=self.evaluator,
+            action_executor=self.actions,
+        )
+
+        # Set trust tiers
+        trust_tiers = thrall_cfg.get("trust_tiers", {})
+        self.engine.set_trust_tiers(trust_tiers)
+
+        # Load recipes and prompts
+        summary = load_all(self._plugin_dir, self.db, self.evaluator)
+        self.engine.load_recipes()
+        dry_label = " [DRY_RUN MODE]" if self._dry_run else ""
+        self._log.info(f"Thrall switchboard ready{dry_label}: {summary}")
+
+        # Cockpit for skill calls
+        # Use 127.0.0.1, not localhost — Python urllib on Windows tries IPv6
+        # first which adds ~2s per request due to connection timeout fallback
+        self._cockpit_url = thrall_cfg.get("cockpit_url", "http://127.0.0.1:8080")
+        self._cockpit_token = ""
+        if ctx.vault_get:
+            try:
+                self._cockpit_token = ctx.vault_get("cockpit_token") or ""
+            except Exception:
                 pass
+        if not self._cockpit_token:
+            self._cockpit_token = thrall_cfg.get("cockpit_token", "")
 
-        return breaker
+        # Compilation config
+        compile_cfg = config.get("compilation", {})
+        self._compile_interval = compile_cfg.get("interval_seconds", 3600)
+        self._compile_buffer = compile_cfg.get("buffer", "mail-digest")
 
-    def _get_breaker_cached(self, name: str) -> Optional[dict]:
-        """Get breaker by name with in-memory cache (C-2: avoid disk I/O per message)."""
-        now = time.time()
-        cached = self._breaker_cache.get(name)
-        if cached is not None:
-            cached_at, breaker = cached
-            if now - cached_at < self._breaker_cache_ttl:
-                return breaker
+        # Sentinel reload tracking
+        self._last_reload = time.time()
 
-        # Cache miss or stale — read from disk
-        breaker = self._load_breaker(name)
-        self._breaker_cache[name] = (now, breaker)
-        return breaker
-
-    def _check_breakers(self, from_node: str) -> Optional[dict]:
-        """Check if any breaker blocks this sender. Returns breaker dict or None.
-        Uses in-memory cache to avoid disk reads on every message (C-2)."""
-        if not self._breaker_dir.exists():
-            return None
-
-        prefix = self._safe_prefix(from_node)
-
-        # Check order: global > node-specific
-        for name in ("global", prefix):
-            breaker = self._get_breaker_cached(name)
-            if breaker is not None:
-                return breaker
-
-        return None
-
-    def _trip_breaker(self, breaker_type: str, target: str, reason: str,
-                      auto_expire_seconds: int = 3600):
-        """Create a breaker file. Target must be a validated hex prefix or 'global'."""
-        # Validate target to prevent path traversal
-        if target != "global" and not thrall_mod._HEX_RE.match(target):
-            self._log.warning(f"Thrall: refusing breaker for invalid target: {target!r}")
-            return
-
-        self._breaker_dir.mkdir(exist_ok=True)
-
-        now = datetime.now(timezone.utc)
-        expires_at = ((now + timedelta(seconds=auto_expire_seconds)).isoformat()
-                      if auto_expire_seconds > 0 else None)
-        breaker = {
-            "type": breaker_type,
-            "target": target,
-            "reason": reason[:500],
-            "tripped_at": now.isoformat(),
-            "trip_count": 1,
-            "last_event": reason[:500],
-            "auto_expire_seconds": auto_expire_seconds,
-            "expires_at": expires_at,
-        }
-
-        path = self._breaker_dir / f"{target}.json"
-
-        # Increment trip_count if breaker already exists
-        try:
-            raw = path.read_text(encoding="utf-8")
-            existing = json.loads(raw)
-            breaker["trip_count"] = existing.get("trip_count", 0) + 1
-        except (OSError, FileNotFoundError, json.JSONDecodeError):
-            pass
-
-        path.write_text(json.dumps(breaker, indent=2), encoding="utf-8")
-        # Invalidate cache for this breaker (C-2)
-        self._breaker_cache.pop(target, None)
-        self._log_event("BREAKER_TRIP", target, reason[:200])
-
-    async def _wake_agent(self, breaker_type: str, target: str, reason: str):
-        """Send system mail to own node to wake the agent."""
-        if not self._ctx.send_mail:
-            self._log_event("WAKE_SKIP", target, "send_mail not wired")
-            return
-        try:
-            await self._ctx.send_mail(
-                to_node=self._ctx.node_id,
-                msg_type="system",
-                body={
-                    "type": "thrall_breaker",
-                    "wake_agent": True,
-                    "breaker_type": breaker_type,
-                    "target": target,
-                    "reason": reason[:500],
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                session_id="thrall:breaker",
-                system=True,
-            )
-        except Exception as e:
-            self._log.warning(f"Thrall: agent wake failed: {e}")
-            self._log_event("WAKE_FAIL", target, str(e)[:200])
-
-    # ── Rate limiter ──
-
-    def _check_rate(self, node_prefix: str) -> bool:
-        now = time.time()
-        window = self._rate_limit.get(node_prefix, [])
-        window = [t for t in window if now - t < 3600]
-        if not window:
-            # Remove empty entry to prevent unbounded growth (I-1)
-            self._rate_limit.pop(node_prefix, None)
+        # Bus event subscription (v0.32.0+ graceful degradation)
+        self._bus_sub = None
+        self._bus_events_processed = 0
+        self._bus_events_dropped = 0
+        self._bus_rate_counters: Dict[str, List[float]] = {}  # pattern -> timestamps
+        self._bus_consumer_task = None
+        if getattr(self._ctx, "subscribe_events", None):
+            patterns = self._collect_event_patterns()
+            if patterns:
+                try:
+                    self._bus_sub = self._ctx.subscribe_events(*patterns)
+                    self._bus_consumer_task = asyncio.get_event_loop().create_task(
+                        self._bus_consumer())
+                    self._log.info(f"Thrall subscribed to bus: {patterns}")
+                except Exception as e:
+                    self._log.warning(f"Bus subscription failed: {e}")
         else:
-            self._rate_limit[node_prefix] = window
-        return len(window) < self._max_per_hour
+            self._log.info("Bus API not available (pre-v0.32.0) — bus events disabled")
 
-    def _record_rate(self, node_prefix: str):
-        window = self._rate_limit.get(node_prefix, [])
-        window.append(time.time())
-        self._rate_limit[node_prefix] = window
-        # Cap rate_limit dict size (W-2: unbounded growth from unique node prefixes)
-        if len(self._rate_limit) > _MAX_COUNTER_ENTRIES:
-            oldest = sorted(self._rate_limit,
-                            key=lambda k: max(self._rate_limit[k], default=0))
-            for k in oldest[:len(self._rate_limit) - _MAX_COUNTER_ENTRIES]:
-                del self._rate_limit[k]
-
-    # ── Solicited tracking ──
-
-    def record_send(self, to_node: str, session_id: str):
-        """Record that we sent a message (for solicited reply detection).
-
-        MUST be called by the responder plugin when it sends a reply.
-        Without this, _is_solicited always returns False and all replies
-        use the base threshold (no solicited double-threshold).
-        """
-        key = (self._safe_prefix(to_node), session_id)
-        self._solicited_sends[key] = time.time()
-        # LRU eviction
-        while len(self._solicited_sends) > _MAX_COUNTER_ENTRIES:
-            self._solicited_sends.popitem(last=False)
-
-    def _is_solicited(self, from_node: str, session_id: str) -> bool:
-        """Check if we sent a message to this node+session (meaning their reply is solicited)."""
-        key = (self._safe_prefix(from_node), session_id)
-        ts = self._solicited_sends.get(key)
-        if ts is None:
-            return False
-        if time.time() - ts > 3600:
-            return False
-        return True
-
-    # ── Loop detection ──
-
-    def _check_loop(self, from_node: str, session_id: Optional[str]) -> Optional[str]:
-        """Check for reply loops. Returns None if OK, or reason string if loop detected.
-
-        NOTE: All mutations to _reply_counter happen synchronously within the
-        asyncio event loop (no awaits between read and write). If a future refactor
-        adds an await here, a lock will be needed.
-        """
-        prefix = self._safe_prefix(from_node)
-
-        # Use session_id if present and not auto-generated, else node-only bucket
-        if session_id and not session_id.startswith("resp:"):
-            key = (session_id, prefix)
-            threshold = self._loop_threshold
-        else:
-            key = ("default", prefix)
-            threshold = self._loop_threshold_sessionless
-
-        now = time.time()
-        window = self._reply_counter.get(key, [])
-        window = [t for t in window if now - t < _REPLY_WINDOW_SECONDS]
-        window.append(now)
-
-        # LRU: move to end (most recently used)
-        if key in self._reply_counter:
-            self._reply_counter.move_to_end(key)
-        self._reply_counter[key] = window
-
-        # LRU eviction
-        while len(self._reply_counter) > _MAX_COUNTER_ENTRIES:
-            self._reply_counter.popitem(last=False)
-
-        # Solicited replies get double threshold
-        solicited = self._is_solicited(from_node, session_id or "")
-        effective_threshold = threshold * 2 if solicited else threshold
-
-        if len(window) > effective_threshold:
-            return (f"loop detected: {len(window)} replies from {prefix} "
-                    f"in session '{session_id or 'default'}' "
-                    f"(threshold: {effective_threshold}, solicited: {solicited})")
-
-        return None
-
-    def _check_knock_pattern(self, from_node: str) -> bool:
-        """Check if a node is persistently knocking (many drops in short window).
-        Returns True if knock threshold exceeded. Synchronous — safe on event loop
-        because thrall.db is small and indexed."""
-        prefix = self._safe_prefix(from_node)
-        cutoff = time.time() - 3600
-        # Use exact prefix match via substr, not LIKE (prevents wildcard injection)
-        row = self._db.execute(
-            """SELECT count(*) FROM thrall_classifications
-               WHERE substr(from_node, 1, 16) = ? AND action = 'drop'
-               AND created_at > ?""",
-            (prefix, cutoff)).fetchone()
-        count = row[0] if row else 0
-        return count >= self._knock_threshold
-
-    # ── Main hook ──
+    # ── Plugin hooks ──
 
     async def on_mail_received(self, msg_type: str, from_node: str,
-                               to_node: str, body: Any,
-                               session_id: Optional[str]) -> None:
+                                to_node: str, body: Any,
+                                session_id: Optional[str] = None) -> None:
+        """Called by knarr core on every inbound message.
+
+        Runs matching recipes. Does not return a value — suppression is
+        handled by the action (drop/compile silently consume the message;
+        wake sends a system mail that the agent plugin picks up).
+        """
         if not self._enabled:
             return
 
-        prefix = self._safe_prefix(from_node)
-
-        # Skip invalid node IDs
-        if prefix == "invalid":
-            self._log_event("SKIP_INVALID", from_node[:20], "non-hex node ID")
+        # Skip system/ack/delivery types
+        ignore_types = self._config.get("ignore_msg_types",
+                                         ["ack", "delivery", "system"])
+        if msg_type in ignore_types:
             return
 
-        # Skip own node
-        if from_node == self._ctx.node_id:
+        # Build envelope
+        body_text = _extract_body_text(body)
+        envelope = Envelope(
+            trigger_type="on_mail",
+            timestamp=time.time(),
+            fields={
+                "from_node": from_node or "",
+                "to_node": to_node or "",
+                "msg_type": msg_type or "text",
+                "body_text": body_text,
+                "body_json": json.dumps(body) if isinstance(body, dict) else str(body),
+                "session_id": session_id or "",
+            },
+        )
+
+        # Match recipes
+        matched = self.engine.match_recipes("on_mail", envelope)
+        if not matched:
+            if self._debug:
+                self._log.debug(f"No recipe matched for mail from {from_node[:16]}")
             return
 
-        # Skip ignored message types
-        if (msg_type or "text") in self._ignore_msg_types:
-            return
-
-        # ── Breaker check (before any work) ──
-        breaker = self._check_breakers(from_node)
-        if breaker:
-            self._log_event("BREAKER_BLOCKED", prefix,
-                            f"breaker={breaker.get('target', '?')}: "
-                            f"{breaker.get('reason', '?')}")
-            self._record_classification(
-                msg_id=None, from_node=from_node,
-                decision={"action": "breaker_blocked",
-                          "trust_tier": "unknown", "wall_ms": 0,
-                          "reasoning": f"breaker: {breaker.get('reason', '?')}",
-                          "prompt_hash": self._active_prompt_hash},
-                session_id=session_id)
-            return
-
-        # Parse body text — handle any shape (str, list, int, None, dict)
-        if isinstance(body, str):
+        # Run all matching recipes
+        # dry_run does NOT skip actions — thrall runs the full pipeline.
+        # The dry_run flag is carried in the briefing so the AGENT session
+        # knows to write a report instead of acting. thrall-inject uses
+        # mode_override="manual" separately for pure pipeline testing.
+        for recipe_name in matched:
             try:
-                body = json.loads(body)
-            except (json.JSONDecodeError, TypeError):
-                body = {"content": body}
-        if body is None:
-            body = {}
-        if not isinstance(body, dict):
-            # Non-dict JSON (list, number, bool) — wrap it (GPT C-2: remote DoS fix)
-            body = {"content": str(body)}
-
-        body_text = body.get("content", body.get("text", ""))
-        if not body_text:
-            # Truncate body BEFORE json.dumps to avoid allocating huge strings (W-8)
-            preview_body = {k: (v[:_MAX_BODY_PREVIEW] if isinstance(v, str) else v)
-                           for k, v in list(body.items())[:10]}
-            body_text = json.dumps(preview_body)
-        if not body_text.strip():
-            return
-
-        # Message ID (if available in body)
-        msg_id = body.get("_handler_message_id")
-
-        # Session
-        if not session_id:
-            session_id = f"resp:{prefix}"
-
-        # ── Triage ──
-        if self._thrall_enabled:
-            if self._shutting_down:
-                return
-
-            self._inflight += 1
-            try:
-                decision = await thrall_mod.triage(
-                    from_node=from_node,
-                    body_text=body_text,
-                    msg_type=msg_type or "text",
-                    trust_tiers=self._trust_tiers,
-                    config=self._thrall_config,
-                    log=self._log,
-                    active_prompt=self._active_prompt,
+                result = await self.engine.run(recipe_name, envelope)
+                dry_tag = " [DRY_RUN]" if self._dry_run else ""
+                self._log.info(
+                    f"PIPELINE {recipe_name}{dry_tag}: "
+                    f"filter={result.filter_result.decision} "
+                    f"eval={result.eval_result.eval_type}->{result.eval_result.action} "
+                    f"action={result.action_result.name} "
+                    f"wall={result.wall_ms}ms"
                 )
-            finally:
-                self._inflight -= 1
-
-            if self._shutting_down:
-                return
-
-            action = decision["action"]
-
-            self._log_event("TRIAGE", prefix,
-                            f"action={action} tier={decision['trust_tier']} "
-                            f"wall={decision['wall_ms']}ms "
-                            f"reason={decision.get('reason', '?')}")
-
-            # Record every classification (including drops)
-            self._record_classification(msg_id, from_node, decision, session_id)
-
-            if action == "drop":
-                # Check knock pattern (sustained drops from same node)
-                if self._check_knock_pattern(from_node):
-                    self._log_event("KNOCK_ALERT", prefix,
-                                    f"sustained drops (threshold: {self._knock_threshold})")
-                    await self._wake_agent("knock", prefix,
-                                           f"sustained drops from {prefix}")
-                return
-
-            # ── Loop detection (after triage, before forwarding) ──
-            loop_reason = self._check_loop(from_node, session_id)
-            if loop_reason:
-                self._log_event("LOOP_DETECTED", prefix, loop_reason)
-                self._trip_breaker("node", prefix, loop_reason,
-                                   auto_expire_seconds=3600)
-                await self._wake_agent("node", prefix, loop_reason)
-                self._record_classification(
-                    msg_id=None, from_node=from_node,
-                    decision={"action": "loop_blocked",
-                              "trust_tier": decision.get("trust_tier", "unknown"),
-                              "wall_ms": 0,
-                              "reasoning": loop_reason,
-                              "prompt_hash": self._active_prompt_hash},
-                    session_id=session_id)
-                return
-
-            # Rate limit check
-            if not self._check_rate(prefix):
-                self._log_event("SKIP_RATE", prefix,
-                                f"rate limit ({self._max_per_hour}/hr)")
-                return
-            self._record_rate(prefix)  # GPT W-1: was never called, rate limiter was dead
-
-        else:
-            # Thrall disabled — no classification, no loop detection
-            self._log_event("PASS_THROUGH", prefix, "thrall disabled")
-
-        # Message passed all gates. The downstream handler (agent, responder,
-        # or application code) processes it from here. Thrall's job is done.
-        #
-        # NOTE: This plugin does NOT call Claude or send replies. It is a
-        # guard — it classifies, records, and blocks. The responder
-        # (if enabled separately) handles auto-reply via its own plugin.
-
-    # ── Tick: pruning and eviction ──
+            except Exception as e:
+                self._log.error(f"Pipeline {recipe_name} failed: {e}")
 
     async def on_tick(self, peers: List[NodeInfo], health: NodeHealth) -> None:
+        """Called on every node tick (~10s). Handles timers and cleanup."""
         if not self._enabled:
             return
-
-        # Flush pending DB commits on every tick (C-3: batched commits)
-        self._flush_commits()
-
-        now = time.time()
-        if now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
+        if self._processing:
             return
 
-        # Prune expired classification records (prune commit is standalone, not batched)
-        deleted = self._db.execute(
-            "DELETE FROM thrall_classifications WHERE ttl_expires < ?",
-            (now,)).rowcount
-        if deleted:
-            self._db.commit()
-            self._log_event("PRUNE", "-", f"removed {deleted} expired classifications")
+        self._tick_count += 1
+        # Run every 6th tick (~60s)
+        if self._tick_count % 6 != 0:
+            return
 
-        # Prune expired breaker files + invalidate cache
-        if self._breaker_dir.exists():
-            for path in self._breaker_dir.glob("*.json"):
+        self._processing = True
+        try:
+            # Check compilation timer flush
+            await self.actions.check_timer_flush(
+                self._compile_buffer, self._compile_interval)
+
+            # Run on_tick recipes (health checks, etc.)
+            envelope = Envelope(
+                trigger_type="on_tick",
+                timestamp=time.time(),
+                fields={
+                    "peer_count": str(len(peers)),
+                    "tick": str(self._tick_count),
+                },
+            )
+            matched = self.engine.match_recipes("on_tick", envelope)
+            for recipe_name in matched:
                 try:
-                    breaker = json.loads(path.read_text(encoding="utf-8"))
-                    expires_at = breaker.get("expires_at")
-                    if expires_at:
-                        exp_ts = datetime.fromisoformat(expires_at).timestamp()
-                        if now > exp_ts:
-                            path.unlink(missing_ok=True)
-                            self._breaker_cache.pop(path.stem, None)
-                            self._log_event("BREAKER_EXPIRED", path.stem,
-                                            "pruned on tick")
-                except (json.JSONDecodeError, OSError, ValueError):
-                    pass
-        # Clear entire breaker cache on prune tick (refresh from disk)
-        self._breaker_cache.clear()
+                    result = await self.engine.run(recipe_name, envelope)
+                    if result.action_result.name not in ("skip", "log", "manual_skip"):
+                        self._log.info(
+                            f"PIPELINE {recipe_name}: "
+                            f"eval={result.eval_result.eval_type}->{result.eval_result.action} "
+                            f"action={result.action_result.name} "
+                            f"wall={result.wall_ms}ms"
+                        )
+                except Exception as e:
+                    self._log.error(f"Tick pipeline {recipe_name} failed: {e}")
 
-        # Prune stale reply counter entries
-        stale_keys = []
-        for key, timestamps in self._reply_counter.items():
-            fresh = [t for t in timestamps if now - t < _REPLY_WINDOW_SECONDS]
-            if not fresh:
-                stale_keys.append(key)
-            else:
-                self._reply_counter[key] = fresh
-        for key in stale_keys:
-            del self._reply_counter[key]
+            # Check LLM queue backpressure (synthetic bus event)
+            bp_envelope = self._check_queue_backpressure()
+            if bp_envelope:
+                bp_matched = self.engine.match_recipes("on_event", bp_envelope)
+                for recipe_name in bp_matched:
+                    try:
+                        result = await self.engine.run(recipe_name, bp_envelope)
+                        if result.action_result.name not in ("skip", "log", "manual_skip"):
+                            self._log.info(
+                                f"PIPELINE {recipe_name} [backpressure]: "
+                                f"depth={bp_envelope.get('queue_depth')} "
+                                f"drop_rate={bp_envelope.get('bus_drop_rate')}% "
+                                f"action={result.action_result.name}")
+                    except Exception as e:
+                        self._log.error(f"Backpressure pipeline {recipe_name} failed: {e}")
 
-        # Prune stale solicited sends (older than 1 hour)
-        stale_sends = [k for k, ts in self._solicited_sends.items()
-                       if now - ts > 3600]
-        for k in stale_sends:
-            del self._solicited_sends[k]
+            # Cleanup expired context (every ~5 min)
+            if self._tick_count % 30 == 0:
+                expired = self.db.cleanup_expired_context()
+                if expired > 0:
+                    self._log.info(f"Cleaned {expired} expired context entries")
 
-        # Prune stale rate limit entries (empty windows)
-        stale_rates = [k for k, v in self._rate_limit.items() if not v]
-        for k in stale_rates:
-            del self._rate_limit[k]
+            # Check for sentinel reload
+            await self._check_reload()
 
-        self._last_prune = now
-
-    # ── Reload prompt on demand ──
-
-    def reload_prompt(self):
-        """Reload active prompt from DB. Called from event loop thread
-        (via thrall_admin skill handler which runs on event loop)."""
-        self._active_prompt = self._load_active_prompt()
-        self._active_prompt_hash = thrall_mod.prompt_hash(self._active_prompt)
-        self._log.info(f"Thrall: prompt reloaded, hash={self._active_prompt_hash}")
-
-    # ── Shutdown ──
+        except Exception as e:
+            self._log.error(f"Tick failed: {e}")
+        finally:
+            self._processing = False
 
     async def on_shutdown(self) -> None:
-        if not self._enabled:
-            return
+        """Graceful shutdown."""
+        if hasattr(self, "db"):
+            self.db.close()
+        self._log.info("Thrall switchboard shut down")
 
-        # Signal shutdown — no new triage calls or DB writes accepted
-        self._shutting_down = True
+    # ── Bus event consumer ──
 
-        # Wait for in-flight triage calls to complete (max 15s)
-        for _ in range(150):
-            if self._inflight <= 0:
-                break
-            await asyncio.sleep(0.1)
+    def _collect_event_patterns(self) -> list:
+        """Extract fnmatch patterns from on_event recipes."""
+        patterns = set()
+        for name, config in self.engine._recipes.items():
+            trigger = config.get("trigger", {})
+            if trigger.get("type") == "on_event":
+                pat = trigger.get("event_pattern", "")
+                if pat:
+                    patterns.add(pat)
+        return list(patterns) or ["*"]
 
-        # Flush any remaining uncommitted writes
-        if self._pending_commits > 0:
+    def _bus_rate_check(self, event_name: str, window: float = 60.0,
+                        max_per_window: int = 30) -> bool:
+        """Per-event-type rate limiter. Returns True if allowed, False if dropped.
+
+        Prevents bus event floods from overwhelming the pipeline. This is
+        separate from recipe-level cooldowns — this is a hard gate BEFORE
+        the pipeline even runs.
+        """
+        now = time.time()
+        cutoff = now - window
+
+        # A2 fix: evict stale categories when dict grows past cap.
+        # Full sweep only triggers at 100+ keys to avoid per-call overhead.
+        if len(self._bus_rate_counters) > 100:
+            self._bus_rate_counters = {
+                k: [t for t in ts if t > cutoff]
+                for k, ts in self._bus_rate_counters.items()
+                if any(t > cutoff for t in ts)
+            }
+
+        # Use the first dotted segment as the rate-limit key
+        # e.g. "credit.limit_warning" -> "credit"
+        key = event_name.split(".")[0] if "." in event_name else event_name
+
+        if key not in self._bus_rate_counters:
+            self._bus_rate_counters[key] = []
+
+        # Prune old timestamps for this key
+        self._bus_rate_counters[key] = [t for t in self._bus_rate_counters[key]
+                                        if t > cutoff]
+        timestamps = self._bus_rate_counters[key]
+
+        if len(timestamps) >= max_per_window:
+            self._bus_events_dropped += 1
+            return False
+
+        timestamps.append(now)
+        return True
+
+    async def _bus_consumer(self):
+        """Consume bus events and route through pipeline.
+
+        All bus recipes should use hotwire evaluation (no LLM) to avoid
+        overwhelming the single inference slot. The rate limiter above
+        provides a hard cap per event category.
+        """
+        while self._enabled:
             try:
-                self._db.commit()
-            except sqlite3.ProgrammingError:
-                pass  # DB already closed somehow
+                event = await self._bus_sub.next()
+                event_name = event.get("event_type", event.get("type", "unknown"))
 
-        self._db.close()
-        self._log.info("Thrall guard shut down")
+                # Hard rate-limit gate — drop before pipeline
+                if not self._bus_rate_check(event_name):
+                    if self._debug:
+                        self._log.debug(f"BUS drop (rate): {event_name}")
+                    continue
+
+                self._bus_events_processed += 1
+
+                envelope = Envelope(
+                    trigger_type="on_event",
+                    timestamp=time.time(),
+                    fields={
+                        "event_name": event_name,
+                        **{k: str(v) for k, v in event.items()
+                           if k not in ("event_type", "type")},
+                    },
+                )
+
+                matched = self.engine.match_recipes("on_event", envelope)
+                for recipe_name in matched:
+                    try:
+                        result = await self.engine.run(recipe_name, envelope)
+                        if result.action_result.name not in ("skip", "log", "manual_skip"):
+                            self._log.info(
+                                f"PIPELINE {recipe_name} [bus:{event_name}]: "
+                                f"eval={result.eval_result.eval_type}->{result.eval_result.action} "
+                                f"action={result.action_result.name} wall={result.wall_ms}ms")
+                    except Exception as e:
+                        self._log.error(f"Bus pipeline {recipe_name} failed: {e}")
+            except Exception as e:
+                self._log.error(f"Bus consumer error: {e}")
+                await asyncio.sleep(1)
+
+    # ── Queue backpressure check (runs on tick) ──
+
+    def _check_queue_backpressure(self) -> Optional[Envelope]:
+        """Check if the LLM inference queue is backed up.
+
+        Returns an Envelope for the backpressure recipe if pressure detected,
+        None otherwise. This is a synthetic event — no bus needed.
+        """
+        queue_depth = getattr(self.evaluator, "_queue_depth", 0)
+
+        # Also check bus drop ratio as a pressure signal
+        total = self._bus_events_processed + self._bus_events_dropped
+        drop_rate = (self._bus_events_dropped / total * 100) if total > 0 else 0
+
+        if queue_depth == 0 and drop_rate < 20:
+            return None
+
+        return Envelope(
+            trigger_type="on_event",
+            timestamp=time.time(),
+            fields={
+                "event_name": "thrall.backpressure",
+                "queue_depth": str(queue_depth),
+                "bus_processed": str(self._bus_events_processed),
+                "bus_dropped": str(self._bus_events_dropped),
+                "bus_drop_rate": f"{drop_rate:.0f}",
+            },
+        )
+
+    # ── Sentinel reload ──
+
+    async def _check_reload(self):
+        """Check for recipe/prompt changes and reload if needed."""
+        reload_file = os.path.join(self._plugin_dir, "thrall.reload")
+        if os.path.exists(reload_file):
+            try:
+                mtime = os.path.getmtime(reload_file)
+                if mtime > self._last_reload:
+                    # Reload recipes + prompts
+                    summary = load_all(self._plugin_dir, self.db, self.evaluator)
+                    self.engine.load_recipes()
+                    self._last_reload = time.time()
+                    self._log.info(f"Recipes reloaded: {summary}")
+
+                    # Check if backend config changed — hot-swap if needed
+                    try:
+                        import tomllib
+                    except ImportError:
+                        import tomli as tomllib
+                    toml_path = os.path.join(self._plugin_dir, "plugin.toml")
+                    if os.path.exists(toml_path):
+                        with open(toml_path, "rb") as f:
+                            new_config = tomllib.load(f)
+                        new_thrall_cfg = new_config.get("config", {}).get("thrall", {})
+                        new_backend_name = new_thrall_cfg.get("backend", "local")
+                        if new_backend_name != self._current_backend_name:
+                            new_backend = create_backend(
+                                new_thrall_cfg, vault_get=self._ctx.vault_get)
+                            self.evaluator.set_backend(new_backend)
+                            self._current_backend_name = new_backend_name
+                            self._log.info(f"Backend swapped to: {new_backend_name}")
+
+                        # Check cascade L1 config changes
+                        new_cascade = new_thrall_cfg.get("cascade", {})
+                        new_cascade_enabled = new_cascade.get("enabled", False)
+                        new_cascade_l1_type = new_cascade.get("l1_backend", "")
+                        if new_cascade_enabled != self._cascade_enabled or \
+                           new_cascade_l1_type != self._cascade_l1_type:
+                            if new_cascade_enabled and new_cascade_l1_type:
+                                try:
+                                    l1_cfg = dict(new_thrall_cfg)
+                                    l1_cfg["backend"] = new_cascade_l1_type
+                                    new_l1 = create_backend(
+                                        l1_cfg, vault_get=self._ctx.vault_get)
+                                    self.evaluator.set_l1_backend(new_l1)
+                                    self._log.info(f"Cascade L1 swapped: {new_l1.name}/{new_l1.model_name}")
+                                except Exception as e:
+                                    self._log.warning(f"Cascade L1 reload failed: {e}")
+                            else:
+                                self.evaluator.set_l1_backend(None)
+                                self._log.info("Cascade L1 disabled via reload")
+                            self._cascade_enabled = new_cascade_enabled
+                            self._cascade_l1_type = new_cascade_l1_type
+
+                    # Re-subscribe to bus if patterns changed (A1 fix:
+                    # cancel old consumer task so it doesn't block on
+                    # the stale subscription object)
+                    if self._bus_sub and getattr(self._ctx, "subscribe_events", None):
+                        new_patterns = self._collect_event_patterns()
+                        try:
+                            self._bus_sub = self._ctx.subscribe_events(*new_patterns)
+                            if self._bus_consumer_task:
+                                self._bus_consumer_task.cancel()
+                            self._bus_consumer_task = asyncio.get_event_loop().create_task(
+                                self._bus_consumer())
+                            self._log.info(f"Bus re-subscribed: {new_patterns}")
+                        except Exception as e:
+                            self._log.warning(f"Bus re-subscribe failed: {e}")
+            except Exception as e:
+                self._log.error(f"Reload failed: {e}")
+
+    # ── Action callbacks ──
+
+    async def _send_mail(self, to_node: str, msg_type: str,
+                         body: dict, session_id: str):
+        """Send mail via PluginContext."""
+        if self._ctx.send_mail:
+            await self._ctx.send_mail(to_node, msg_type, body, session_id)
+        else:
+            self._log.warning(f"send_mail not available (would send to {to_node[:16]})")
+
+    async def _call_skill(self, skill_name: str, input_data: dict) -> dict:
+        """Call a skill via cockpit API. Async submit + poll for result."""
+        if not self._cockpit_token:
+            self._log.warning(f"call_skill: no cockpit token (would call {skill_name})")
+            return {"status": "error", "message": "no cockpit token configured"}
+
+        try:
+            result = await asyncio.to_thread(
+                self._cockpit_execute, skill_name, input_data)
+            self._log.info(f"SKILL_CALL {skill_name}: {str(result)[:120]}")
+            return result
+        except Exception as e:
+            self._log.error(f"SKILL_CALL {skill_name} failed: {e}")
+            return {"status": "error", "message": str(e)}
+
+    def _cockpit_execute(self, skill_name: str, skill_input: dict) -> dict:
+        """Synchronous cockpit skill execution (runs in thread)."""
+        # Build SSL context only for HTTPS URLs
+        ssl_ctx = None
+        if self._cockpit_url.startswith("https"):
+            import ssl
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        payload = json.dumps({
+            "skill": skill_name,
+            "input": skill_input,
+            "timeout": 120,
+        }).encode()
+
+        req = Request(
+            f"{self._cockpit_url}/api/execute",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._cockpit_token}",
+            },
+        )
+        resp = urlopen(req, timeout=130, context=ssl_ctx)
+        data = json.loads(resp.read())
+        job_id = data.get("job_id")
+        if job_id:
+            return self._poll_job(job_id, ssl_ctx)
+        return data.get("result", data)
+
+    def _poll_job(self, job_id: str, ssl_ctx, max_wait: int = 120) -> dict:
+        """Poll cockpit for async job result.
+
+        Uses progressive backoff: 0.3s for the first few polls (catches fast
+        skills like knarr-mail that complete in <100ms), then ramps to 2s for
+        long-running skills.
+        """
+        deadline = time.time() + max_wait
+        poll_count = 0
+        while time.time() < deadline:
+            req = Request(
+                f"{self._cockpit_url}/api/jobs/{job_id}",
+                headers={"Authorization": f"Bearer {self._cockpit_token}"},
+            )
+            try:
+                resp = urlopen(req, timeout=10, context=ssl_ctx)
+                data = json.loads(resp.read())
+                status = data.get("status", "")
+                if status == "completed":
+                    return data.get("result", data.get("output_data", {}))
+                if status == "failed":
+                    return {"status": "error", "error": data.get("error", "job failed")}
+            except URLError:
+                pass
+            poll_count += 1
+            # Progressive backoff: 0.3s x3, 1s x3, then 2s
+            if poll_count <= 3:
+                time.sleep(0.3)
+            elif poll_count <= 6:
+                time.sleep(1)
+            else:
+                time.sleep(2)
+        return {"status": "error", "error": f"job {job_id} timed out after {max_wait}s"}
+
+    async def _summon_agent(self, briefing: dict, buffer_name: str,
+                            trigger: str, entries: list):
+        """Wake the agent with a structured briefing.
+
+        Sends a system mail to self that the agent plugin picks up.
+        This is the ONLY path that spins up a Claude session.
+
+        briefing is a rich dict with mode ("respond" or "process"),
+        full message context, and artifact paths.
+        """
+        # Inject dry_run into briefing so the agent session knows
+        if self._dry_run:
+            briefing["dry_run"] = True
+            briefing["dry_run_instructions"] = (
+                "DRY RUN MODE. Do NOT execute any actions (no mail, no skill calls). "
+                "Instead, write a report to plugins/06-thrall/artifacts/"
+                "dryrun-{timestamp}.md describing what you WOULD have done, "
+                "including the reply you would have sent. "
+                "This lets us observe thrall's judgment without consequences."
+            )
+
+        body = {
+            "type": "thrall_digest",
+            "wake_agent": True,
+            "trigger": trigger,
+            "buffer": buffer_name,
+            "entry_count": len(entries),
+            "briefing": briefing,
+        }
+
+        mode = briefing.get("mode", "respond")
+
+        # Send mail to self — agent plugin's on_mail_received will pick it up
+        if self._ctx.send_mail:
+            own_node = self._ctx.node_id
+            await self._ctx.send_mail(own_node, "system", body,
+                                       f"thrall:{buffer_name}")
+            self._log.info(f"SUMMON [{mode}]: agent woken via system mail "
+                          f"(trigger={trigger}, entries={len(entries)})")
+        else:
+            self._log.warning(f"Cannot summon agent — no send_mail in context")
+            self._log.info(f"SUMMON (dry) [{mode}]: {json.dumps(briefing)[:300]}")
+
+
+def _extract_body_text(body: Any) -> str:
+    """Extract readable text from mail body (various formats)."""
+    if isinstance(body, str):
+        return body
+    if isinstance(body, dict):
+        for key in ("content", "text", "message", "summary"):
+            if key in body:
+                val = body[key]
+                return val if isinstance(val, str) else json.dumps(val)
+        return json.dumps(body)
+    return str(body)
