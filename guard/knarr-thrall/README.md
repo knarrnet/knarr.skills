@@ -1,279 +1,275 @@
-# knarr-thrall: Edge Classification Guard
+# knarr-thrall: Autonomous Switchboard Plugin
 
-**Version**: 0.1.0
-**Requires**: knarr >= 0.29.1, llama-cpp-python (for embedded backend)
+**Version**: 3.3.0
+**Requires**: knarr >= 0.35.0, PyNaCl
 
 ## What is thrall?
 
-Thrall is a **plugin** that sits on your knarr node and **triages every inbound message** before it reaches your agent or inbox. Think of it as a doorman:
+Thrall is a **plugin** that gives your knarr node autonomous intelligence. It intercepts inbound messages, classifies them through a two-stage LLM cascade, and executes actions based on configurable recipes — all without waking your agent or burning API credits on noise.
 
-- **Team mail** (your own nodes) -> instant pass-through, zero latency
-- **Known peers** (trusted nodes you configure) -> classified by a local LLM
-- **Unknown senders** -> classified by a local LLM with a higher bar
+**Core pipeline:**
+```
+Inbound -> TRIGGER -> FILTER -> EVALUATE -> ACTION -> Journal
+            on_mail    trust     L1->L2     drop/log
+            on_event   tiers     cascade    compile
+            on_tick    rate      hotwire    wake/summon
+                       limit               act (skill)
+                       cache               reply
+                       cooldown
+```
 
-For each message, thrall decides one of three actions:
+## Architecture
 
-| Action | Meaning | What happens |
-|--------|---------|-------------|
-| `wake` | Legitimate — needs attention | Message passes through, agent wakes |
-| `reply` | Simple greeting/status check | Message passes through with reply hint |
-| `drop` | Spam, noise, or acknowledgment | Message stays in inbox but agent is NOT woken |
+### Two-stage LLM Cascade
 
-**Thrall is a guard, not an actor.** It never answers questions, never calls skills, never sends replies. It classifies, records, and protects.
+- **L1** (gemma3:1b, CPU, llama-cpp-python, ~2s): Binary drop/escalate. Runs outside the L2 semaphore. Drops ~50% of traffic.
+- **L2** (qwen3:32b, GPU, ollama, ~5s): Full classification with context. Gated by `Semaphore(1)`.
+- L1 saves L2 for substantive mail only.
 
-## Why use it?
+### Three Backends
 
-Without thrall, every inbound message wakes your agent. On a busy network, that means:
-- Spam wakes your agent (wastes Claude/LLM credits)
-- Loop storms between nodes burn resources
-- Acknowledgments ("thanks", "got it") trigger unnecessary processing
+Swappable via `plugin.toml [config.thrall]`:
 
-With thrall:
-- Spam is silently dropped (stays in inbox, just doesn't wake anything)
-- Loops are detected and breakers trip automatically
-- Acks are recognized and dropped
-- Every decision is logged and auditable
+| Backend | Engine | Cost | Use case |
+|---------|--------|------|----------|
+| `local` | llama-cpp-python (CPU) | Zero | Default, VPS, low traffic |
+| `ollama` | HTTP to local/LAN ollama | Zero | GPU available, higher quality |
+| `openai` | Any OpenAI-compatible API | Metered | Cloud models, highest quality |
+
+Hot-swap via sentinel reload (touch `thrall.reload`).
+
+### Recipe Engine
+
+Recipes are TOML files in `recipes/` that define autonomous behaviors:
+
+```toml
+mode = "automated"
+
+[trigger]
+type = "on_tick"              # on_mail | on_event | on_tick
+
+[filter]
+cooldown_key = "health-check"
+cooldown_seconds = 300
+
+[evaluate]
+type = "hotwire"              # llm | hotwire (pattern match, no LLM)
+default_action = "act"
+
+[actions.act]
+skill = "health-check-lite"
+input = {}
+error_buffer = "health-errors"
+```
+
+### Included Recipes (15)
+
+| Recipe | Trigger | Eval | Purpose |
+|--------|---------|------|---------|
+| `mail-triage` | on_mail | llm | LLM classification of inbound mail |
+| `mail-digest` | on_tick | hotwire | Buffered compilation for batch processing |
+| `health-check` | on_tick | hotwire | Periodic skill chain canary |
+| `cluster-probe` | on_tick | hotwire | Execution pipeline probe |
+| `credit-warning` | on_event | hotwire | Credit limit warnings |
+| `security-alert` | on_event | hotwire | Security event monitoring |
+| `task-failures` | on_event | hotwire | Task failure monitoring |
+| `queue-backpressure` | on_tick | hotwire | Queue congestion detection |
+| `selftest` | on_tick | hotwire | 7-point self-test |
+| `swarm-probe` | on_tick | hotwire | Swarm cluster health probe |
+| `settlement-check` | on_tick | hotwire | Autonomous netting proposals (v3.3) |
+| `chat` | on_mail | llm | Conversational chat |
+| `concierge-intake` | on_mail | llm | Service intake classification |
+| `concierge-faq` | on_mail | llm | FAQ auto-response |
+| `concierge-expert` | on_mail | llm | Expert routing |
+
+### Included Prompts (6)
+
+| Prompt | Used by | Purpose |
+|--------|---------|---------|
+| `triage` | mail-triage | L2 full classification |
+| `triage-l1` | cascade L1 | Binary drop/escalate |
+| `chat` | chat recipe | Conversational responses |
+| `concierge-intake` | concierge | Service intake |
+| `concierge-faq` | concierge | FAQ matching |
+| `concierge-expert` | concierge | Expert analysis |
+
+## Settlement Identity (v3.3.0)
+
+Thrall can autonomously sign netting settlement proposals using its own delegated Ed25519 keypair, separate from the node's identity.
+
+### Components
+
+| File | Purpose |
+|------|---------|
+| `identity.py` | Delegated Ed25519 keypair — generated on first init, config-gated, revocable |
+| `wallet.py` | Scoped daily spending ceiling — prevents runaway autonomous spending |
+| `commerce.py` | Cockpit API wrappers — queries ledger, economy, receipts via HTTP |
+| `skills/settlement_check.py` | Skill handler — finds over-threshold positions, signs netting proposals |
+| `recipes/settlement-check.toml` | Hourly on_tick recipe, hotwire eval, no LLM |
+
+### How it works
+
+1. Every hour, the settlement-check recipe fires
+2. Queries bilateral ledger positions via cockpit API
+3. Finds positions above the soft threshold (default 80% utilization)
+4. For each: checks wallet ceiling, builds a signed netting proposal
+5. Submits via knarr-mail as `knarr/commerce/settle_request`
+
+### Configuration
+
+```toml
+[config.thrall.identity]
+enabled = true
+keyfile = "thrall_identity.key"   # auto-generated 32-byte Ed25519 seed
+
+[config.thrall.wallet]
+ceiling = 50.0                    # max credits per day (resets at midnight UTC)
+```
+
+### Revocation
+
+Delete `thrall_identity.key` and restart. Thrall logs `IDENTITY_DISABLED` and settlement-check returns `status: "disabled"`.
 
 ## Quick Start
 
-### 1. Add the plugin files
-
-Copy the plugin directory into your node's `plugins/` folder:
+### 1. Add plugin files
 
 ```
 your-node/
   plugins/
-    06-responder/          # <-- plugin directory
-      handler.py           # main guard logic
-      thrall.py            # LLM backend (embedded or ollama)
-      thrall_admin.py      # prompt management skill
-      plugin.toml          # configuration
+    06-thrall/
+      handler.py, engine.py, evaluate.py, backends.py,
+      actions.py, db.py, loader.py, identity.py, wallet.py,
+      commerce.py, __init__.py, plugin.toml
+      recipes/           # 15 recipe TOML files
+      prompts/           # 6 prompt TOML files
+  skills/
+    settlement_check.py  # settlement skill handler
 ```
 
-### 2. Get the model file
+### 2. Get model files
 
-Thrall uses **gemma3:1b** (Q4_K_M quantized, 778 MB GGUF). You have two options:
-
-**Option A — Pull from ollama** (easiest):
+**L1 (required):** gemma3:1b (~778 MB GGUF)
 ```bash
 ollama pull gemma3:1b
-# Find the GGUF blob:
-# Linux/Mac: ~/.ollama/models/blobs/
-# Windows:   %USERPROFILE%\.ollama\models\blobs\
-# Copy the largest blob file (~778MB) to your models directory
+# Copy the GGUF blob to your models directory
 ```
 
-**Option B — Download directly**:
+**L2 (optional, for cascade):** qwen3:32b via ollama
 ```bash
-# From HuggingFace (exact quantization may vary)
-wget https://huggingface.co/google/gemma-3-1b-it-qat-q4_0-gguf/resolve/main/gemma-3-1b-it-q4_0.gguf
+ollama pull qwen3:32b
 ```
 
-Place it where `model_path` in your config points to (default: `/app/models/gemma3-1b.gguf`).
-
-### 3. Install llama-cpp-python
+### 3. Install dependencies
 
 ```bash
-# CPU only (recommended for VPS)
-CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" pip install llama-cpp-python
-
-# Or plain (no BLAS acceleration)
+# For local backend (CPU inference)
 pip install llama-cpp-python
+
+# For identity/signing
+pip install pynacl
 ```
 
 ### 4. Configure plugin.toml
 
+Edit `plugin.toml` — at minimum set:
+- `cockpit_token` — your cockpit Bearer token
+- `[config.thrall.local] model_path` — path to gemma3:1b GGUF
+- `[config.thrall.trust_tiers]` — your team and known peer node ID prefixes
+
+### 5. Register settlement skill (optional)
+
+In your `knarr.toml`:
 ```toml
-name = "knarr-thrall"
-version = "0.1.0"
-handler = "handler:ThrallGuard"
-
-[config]
-enabled = true
-debug = false                          # set true for verbose logging
-ignore_msg_types = ["ack", "delivery", "system"]
-max_replies_per_hour_per_node = 5
-
-[config.thrall]
-enabled = true
-backend = "embedded"                   # "embedded" (CPU) or "ollama" (external server)
-model_path = "/app/models/gemma3-1b.gguf"
-n_threads = 2                          # match your vCPU count
-timeout_seconds = 30
-fallback = "tier"                      # what to do if LLM fails: "tier"|"wake"|"drop"
-classification_ttl_days = 30           # how long to keep classification records
-loop_threshold = 2                     # replies per session before breaker trips
-loop_threshold_sessionless = 5         # threshold for messages without session IDs
-knock_threshold = 10                   # drops per hour before agent alert
-
-[config.thrall.trust_tiers]
-team = ["abcdef1234567890"]            # 16-char hex prefix of YOUR other nodes
-known = ["fedcba0987654321"]           # 16-char hex prefix of trusted peers
+[skills.settlement-check-lite]
+description = "Autonomous settlement position check"
+handler = "skills/settlement_check.py:handle"
+input_schema = {threshold = "string"}
+output_schema = {status = "string", positions_checked = "string", settlements_proposed = "string", total_amount = "string", wall_ms = "string"}
+price = 0
+tags = ["settlement", "thrall", "internal"]
+visibility = "public"
+allowed_nodes = ["your-node-id-prefix"]
 ```
 
-### 5. Restart your node
+### 6. Restart node
 
 ```bash
 knarr serve --config knarr.toml
 ```
 
-You should see in the logs:
+Expected log output:
 ```
-INFO knarr.plugin.knarr-thrall: Thrall guard initialized: backend=embedded, prompt_hash=1529de3e6bd83d68, loop_threshold=2/5
+INFO thrall.loader: Recipe loaded: mail-triage (mode=automated)
+INFO thrall.loader: Recipe loaded: settlement-check (mode=automated)
+INFO thrall.engine: Loaded 15 recipes
+INFO thrall.identity: IDENTITY_LOADED public_key=b84d1bc2...
+INFO thrall.wallet: WALLET_INIT ceiling=50.0 daily_spent=0.0 remaining=50.0
+INFO knarr.dht.plugins: Loaded plugin: knarr-thrall v3.3.0
 ```
 
-## How Trust Tiers Work
-
-Trust tiers let you skip the LLM for nodes you trust:
+## Trust Tiers
 
 ```toml
 [config.thrall.trust_tiers]
-team = ["ad8d21d81a497993", "401679f0c53ca038"]   # your own nodes
-known = ["d9196be699447a12"]                        # peers you trust
+team = ["ad8d21d81a497993"]    # your own nodes — instant pass, 0ms
+known = ["d9196be699447a12"]   # trusted peers — LLM classifies, lower bar
+# unknown: everyone else      — LLM classifies, higher bar
 ```
 
-- **team**: These are YOUR nodes. Every message from a team node gets `action=wake` instantly (0ms, no LLM call).
-- **known**: Trusted peers. Messages are classified by the LLM but with a lower bar for `wake`.
-- **unknown**: Everyone else. LLM classifies with a higher bar — prefers `drop` unless the message is clearly legitimate.
+## File Reference
 
-**Finding node ID prefixes**: Use the first 16 hex characters of a node's full ID. You can find IDs in your peer table or from `GET /api/status` on any node.
+### Core
 
-## Reading Classification Records
+| File | Lines | Purpose |
+|------|-------|---------|
+| `handler.py` | 685 | Plugin entry, hooks, bus consumer, sentinel reload, backend hot-swap |
+| `engine.py` | 403 | Pipeline engine (TRIGGER->FILTER->EVALUATE->ACTION), cooldown template vars |
+| `evaluate.py` | 335 | LLM orchestrator, L1/L2 cascade, cost tracker, prompt rendering |
+| `backends.py` | 310 | LocalBackend, OllamaBackend, OpenAIBackend + factory |
+| `actions.py` | 393 | Action executor (log, compile, wake, act, reply) |
+| `db.py` | 343 | ThrallDB (SQLite: journal, buffers, context, cache, wallet) |
+| `loader.py` | 82 | Recipe/prompt TOML loader (auto-discovers *.toml) |
 
-Every decision thrall makes is recorded in `thrall.db` (SQLite, in the plugin directory):
+### Settlement Identity (v3.3.0)
 
-```sql
-SELECT from_node, tier, action, reasoning, wall_ms, session_id, prompt_hash
-FROM thrall_classifications
-ORDER BY created_at DESC
-LIMIT 20;
-```
+| File | Lines | Purpose |
+|------|-------|---------|
+| `identity.py` | 119 | Delegated Ed25519 keypair, sign_document, verify, revoke |
+| `wallet.py` | 68 | Scoped daily ceiling, can_spend/record_spend |
+| `commerce.py` | 180 | Cockpit API wrappers, position check, netting doc builder |
+| `skills/settlement_check.py` | 189 | Standalone skill handler for settlement-check-lite |
 
-| Column | What it means |
-|--------|---------------|
-| `from_node` | Full node ID of the sender |
-| `tier` | Trust tier: `team`, `known`, or `unknown` |
-| `action` | `wake`, `reply`, or `drop` |
-| `reasoning` | LLM's explanation (e.g., "skill request", "spam, single word") |
-| `wall_ms` | How long classification took (0 for team, typically 500-2000ms for LLM) |
-| `session_id` | Session ID if the message had one |
-| `prompt_hash` | SHA256 prefix of the prompt used (for auditing prompt changes) |
+## Database
 
-### Using the cockpit API
+Thrall uses its own `thrall.db` (SQLite, in the plugin directory):
 
-If your node has a cockpit, you can also query via the admin skill:
+| Table | Purpose |
+|-------|---------|
+| `thrall_journal` | All classification decisions + actions |
+| `thrall_buffers` | Compilation buffers for batch processing |
+| `thrall_context` | Conversation context per sender |
+| `thrall_cache` | Response cache (dedup) |
+| `thrall_wallet` | Settlement spending ledger (v3.3.0) |
 
-```bash
-# List all prompts
-curl -sk https://localhost:8081/api/execute \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -d '{"skill": "thrall-prompt-load", "input": {"action": "list"}}'
-```
+## Dry Run Mode
 
-## Circuit Breakers
-
-Thrall auto-trips breakers to stop loop storms and persistent spam:
-
-**Loop breaker**: If a node sends more than `loop_threshold` (default: 2) messages that get `wake` or `reply` in the same session within 30 minutes, thrall trips a breaker for that node. This prevents agent-to-agent ping-pong loops.
-
-**Knock alert**: If a node accumulates more than `knock_threshold` (default: 10) drops per hour, thrall sends a system mail to wake your agent with an alert. Your agent can then decide what to do (block the node, add it to known tier, etc.).
-
-Breaker files are stored in `plugins/06-responder/breakers/` as JSON:
-
-```json
-{
-  "type": "loop",
-  "target": "6f5185865618575f",
-  "reason": "Loop detected: 3 replies in session test-sess (threshold: 2)",
-  "tripped_at": "2026-02-27T08:30:00+00:00",
-  "trip_count": 1,
-  "auto_expire_seconds": 3600,
-  "expires_at": "2026-02-27T09:30:00+00:00"
-}
-```
-
-Breakers auto-expire (default: 1 hour). While active, ALL messages from that node are blocked without LLM evaluation.
-
-## The thrall.log File
-
-Thrall writes a human-readable event log to `plugins/06-responder/thrall.log`:
-
-```
-2026-02-27 08:30:01 [DROP] 6f51858656185 spam: single word, no content
-2026-02-27 08:30:02 [WAKE] ad8d21d81a497 team bypass
-2026-02-27 08:30:05 [WAKE] d9196be699447 skill request from known peer
-2026-02-27 08:31:00 [BREAKER_TRIP] 6f51858656185 Loop detected: 3 replies in session
-2026-02-27 08:31:01 [BREAKER_BLOCK] 6f51858656185 breaker active (expires in 59m)
-2026-02-27 09:30:00 [BREAKER_EXPIRED] 6f51858656185 auto-expired after 3600s
-```
-
-## Configuration Reference
-
-### `[config]`
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | `true` | Master switch for the plugin |
-| `debug` | bool | `false` | Enable verbose debug logging |
-| `ignore_msg_types` | list | `["ack","delivery","system"]` | Message types to skip entirely |
-| `max_replies_per_hour_per_node` | int | `5` | Rate limit per sender per hour |
-
-### `[config.thrall]`
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable LLM triage (if false, only tier checks run) |
-| `backend` | string | `"embedded"` | `"embedded"` (llama-cpp) or `"ollama"` (external server) |
-| `model_path` | string | — | Path to GGUF model file (embedded backend) |
-| `n_threads` | int | `2` | CPU threads for inference (match your vCPU count) |
-| `timeout_seconds` | int | `30` | Max time for a single LLM inference |
-| `fallback` | string | `"tier"` | What to do when LLM fails: `"tier"` (use trust tier default), `"wake"` (pass through), `"drop"` |
-| `classification_ttl_days` | int | `30` | Days to keep classification records |
-| `loop_threshold` | int | `2` | Reply count before loop breaker trips (per session) |
-| `loop_threshold_sessionless` | int | `5` | Reply count for messages without session IDs |
-| `knock_threshold` | int | `10` | Drops per hour before agent alert |
-
-### `[config.ollama]` (only if backend = "ollama")
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `base_url` | string | `"http://localhost:11434"` | Ollama server URL |
-| `model` | string | `"gemma3:1b"` | Model name |
-| `timeout` | int | `10` | HTTP timeout in seconds |
-
-## Troubleshooting
-
-### "Thrall guard disabled by config"
-Check that both `config.enabled` and `config.thrall.enabled` are `true` in plugin.toml.
-
-### Model fails to load
-First check that the GGUF file exists at the configured `model_path`. Thrall logs a load failure and won't retry until restart (prevents hot exception loops). Check node logs for the error.
-
-### All messages from a node are being blocked
-Check the `breakers/` directory for an active breaker file. Delete it to unblock, or wait for auto-expiry.
-
-### Classification seems wrong
-Check the `reasoning` field in `thrall_classifications` to see why the LLM made that decision. gemma3:1b is small (1B params) — it won't always agree with human judgment. Adjust the prompt if needed via the admin skill.
-
-### High latency on first message
-The embedded model loads lazily on the first classification. Cold load takes 3-5 seconds, subsequent classifications are 0.5-2 seconds.
+Set `dry_run = true` in plugin.toml to observe thrall's judgment without consequences. Actions are logged to `artifacts/dryrun-{timestamp}.md` instead of being executed.
 
 ## Performance
 
-| Metric | Embedded (CPU) | Ollama (GPU) |
-|--------|----------------|--------------|
-| Cold start (first message) | 3-5s | <1s |
-| Per-message (warm) | 0.5-2s | 0.3-0.5s |
-| Team bypass | 0ms | 0ms |
-| RAM usage | ~1.2GB (model loaded) | 26MB (node only) |
-| GPU usage | 0 | ~1.2GB VRAM |
+| Metric | L1 (CPU) | L2 (GPU) | Hotwire |
+|--------|----------|----------|---------|
+| Per-message | ~2s | ~5s | <1ms |
+| Team bypass | 0ms | 0ms | 0ms |
+| RAM | ~1.2GB | 26MB (client) | 0 |
 
-On a Hetzner CX22 (2 vCPU, 4GB RAM): expect 1-3s per classification, fits comfortably with OS overhead.
+L1 drops ~50% of traffic before L2. Hotwire recipes (on_tick, on_event) skip the LLM entirely.
 
-## Architecture Notes
+## Design Principles
 
-- **Plugin-as-intercept**: thrall hooks into `on_mail_received` (knarr >= 0.29.1). It runs BEFORE your agent sees the message.
-- **Own DB**: thrall uses its own `thrall.db`, NOT the node's `node.db`. This prevents lock contention.
-- **Batched commits**: DB writes are batched (commit every 10 inserts or on tick). Safe for concurrent message flow.
-- **Thread safety**: The embedded LLM backend is NOT thread-safe. Inference is serialized with a lock — only one classification runs at a time.
-- **Shutdown safety**: In-flight classifications complete before shutdown. DB is flushed and closed cleanly.
+- **Plugin, not agent**: Thrall goes through PluginContext API only. Every action has a manual equivalent. Thrall is optional intelligence.
+- **Recipes over code**: New behaviors are TOML files, not Python code. Drop a recipe in `recipes/`, touch `thrall.reload`.
+- **No LLM in the settlement path**: Settlement-check uses hotwire evaluation — zero inference cost.
+- **Delegated identity**: Thrall signs with its own Ed25519 key, not the node key. Revocable by deleting the keyfile.
+- **Scoped spending**: Wallet ceiling prevents runaway autonomous spending.

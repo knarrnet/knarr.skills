@@ -1,35 +1,29 @@
 name = "knarr-thrall"
-version = "3.2.1"
+version = "3.3.0"
 handler = "handler:ThrallPlugin"
 
 [config]
 enabled = true
-debug = true
-dry_run = true
+debug = false
+dry_run = false
 ignore_msg_types = ["ack", "delivery", "system"]
 
 [config.thrall]
 enabled = true
-cockpit_token = ""                # from vault — required for act/wake actions
-backend = "ollama"             # local | ollama | openai
-queue_timeout = 5.0            # seconds to wait for LLM slot before fallback
-
-# Legacy flat keys kept for backwards compat — handler migrates to [local] on init
-model_path = "/path/to/gguf/model"
-n_threads = 4
-n_ctx = 1024
-max_tokens = 128
+cockpit_token = ""                # your cockpit Bearer token (or use vault)
+backend = "local"                 # local | ollama | openai
+queue_timeout = 5.0               # seconds to wait for LLM slot before fallback
 
 [config.thrall.local]
-model_path = "/path/to/gguf/model"
-n_threads = 4
+model_path = "/path/to/gemma3-1b.gguf"
+n_threads = 2
 n_ctx = 1024
 max_tokens = 128
 
 [config.thrall.cascade]
-enabled = true                 # L1 prefilter before L2
-l1_backend = "local"           # backend type for L1 (local = gemma3:1b CPU)
-l1_prompt = "triage-l1"        # prompt file for L1 (binary drop/escalate)
+enabled = true                    # L1 prefilter before L2
+l1_backend = "local"              # backend type for L1 (local = gemma3:1b CPU)
+l1_prompt = "triage-l1"           # prompt file for L1 (binary drop/escalate)
 
 [config.thrall.ollama]
 url = "http://localhost:11434"
@@ -40,17 +34,24 @@ num_ctx = 2048
 timeout = 30
 
 [config.thrall.openai]
-url = "https://generativelanguage.googleapis.com/v1beta"
-model = "gemini-3-flash-preview"
-api_key_vault = "thrall_api_key"
+url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key = ""                      # your API key
 temperature = 0.1
-max_tokens = 128
-timeout = 10
-cost_budget_daily = 1.0        # USD, resets midnight UTC. 0 = unlimited
+max_tokens = 1024
+timeout = 20
+cost_budget_daily = 0             # 0 = unlimited
+
+[config.thrall.identity]
+enabled = false                   # enable delegated Ed25519 keypair
+keyfile = "thrall_identity.key"   # relative to plugin_dir
+
+[config.thrall.wallet]
+ceiling = 50.0                    # max credits per day
 
 [config.thrall.trust_tiers]
-team = []      # 16-char node_id prefixes — team nodes bypass LLM (immediate action)
-known = []     # known nodes get full LLM classification
+team = []                         # 16-char hex prefix of YOUR other nodes
+known = []                        # 16-char hex prefix of trusted peers
 
 [config.compilation]
 interval_seconds = 3600

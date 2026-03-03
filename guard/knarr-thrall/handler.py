@@ -30,6 +30,9 @@ from backends import create_backend
 from actions import ActionExecutor
 from engine import PipelineEngine, Envelope
 from loader import load_all
+from identity import ThrallIdentity
+from wallet import ThrallWallet
+from commerce import ThrallCommerce
 
 logger = logging.getLogger("thrall")
 
@@ -160,6 +163,17 @@ class ThrallPlugin(PluginHooks):
                 pass
         if not self._cockpit_token:
             self._cockpit_token = thrall_cfg.get("cockpit_token", "")
+
+        # Settlement identity — delegated keypair + scoped wallet + commerce
+        identity_cfg = thrall_cfg.get("identity", {})
+        wallet_cfg = thrall_cfg.get("wallet", {})
+        self.identity = ThrallIdentity(self._plugin_dir, identity_cfg)
+        self.wallet = ThrallWallet(self.db, wallet_cfg) if self.identity.enabled else None
+        self.commerce = ThrallCommerce(
+            cockpit_url=self._cockpit_url,
+            cockpit_token=self._cockpit_token,
+            node_id=ctx.node_id,
+        ) if self.identity.enabled else None
 
         # Compilation config
         compile_cfg = config.get("compilation", {})

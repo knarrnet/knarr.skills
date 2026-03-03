@@ -1,9 +1,10 @@
 """Thrall Switchboard — Database layer.
 
-Three tables:
+Tables:
 - thrall_journal: every pipeline execution (audit + training + dryrun)
 - thrall_context: async workflow state (session continuations, flags)
 - thrall_recipes: runtime cache of loaded recipe configs
+- thrall_wallet: delegated spending ledger (settlement identity)
 """
 
 import json
@@ -72,6 +73,16 @@ class ThrallDB:
                 created_at  REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_comp_buffer ON thrall_compilation(buffer_name);
+
+            CREATE TABLE IF NOT EXISTS thrall_wallet (
+                id          INTEGER PRIMARY KEY,
+                timestamp   REAL NOT NULL,
+                amount      REAL NOT NULL,
+                reference   TEXT,
+                peer_pk     TEXT,
+                description TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_ts ON thrall_wallet(timestamp);
         """)
 
         # Migration: add from_node column for fast rate-limit / cache queries
@@ -262,6 +273,30 @@ class ThrallDB:
             "DELETE FROM thrall_compilation WHERE buffer_name=?", (buffer_name,))
         self._conn.commit()
         return entries
+
+    # ── Wallet ──
+
+    def record_wallet_spend(self, amount: float, reference: str = "",
+                            peer_pk: str = "", description: str = ""):
+        self._conn.execute("""
+            INSERT INTO thrall_wallet (timestamp, amount, reference, peer_pk, description)
+            VALUES (?, ?, ?, ?, ?)
+        """, (time.time(), amount, reference, peer_pk, description))
+        self._conn.commit()
+
+    def get_daily_spend(self, day_start: float = None) -> float:
+        """Sum of wallet spending since day_start (default: midnight UTC today)."""
+        if day_start is None:
+            import calendar
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            day_start = calendar.timegm(now.replace(
+                hour=0, minute=0, second=0, microsecond=0).timetuple())
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(amount), 0.0) as total FROM thrall_wallet "
+            "WHERE timestamp >= ?", (day_start,)
+        ).fetchone()
+        return row["total"]
 
     # ── Stats ──
 
