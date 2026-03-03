@@ -4,12 +4,16 @@ Thin wrappers around cockpit API endpoints that give thrall structured
 access to the credit/settlement system. Uses the same HTTP pattern as
 handler.py:_cockpit_execute().
 
+v3.3.1: Receipt queries use PluginContext.query_receipts() (D-051) when
+available, falling back to cockpit HTTP. Ledger/economy queries still
+use cockpit HTTP (no PluginContext equivalent exists).
+
 Methods:
     query_ledger()      → GET /api/ledger
     get_economy()       → GET /api/economy
-    query_receipt(ref)  → GET /api/receipts/{ref}
+    query_receipt(ref)  → ctx.query_receipts() or GET /api/receipts/{ref}
     check_positions()   → computed from ledger
-    build_netting_doc() → signed by ThrallIdentity
+    build_netting_doc() → signed by ThrallIdentity (eddsa-jcs-2022)
     submit_settlement() → send settle_request mail to peer
 """
 
@@ -29,10 +33,12 @@ class ThrallCommerce:
     """Cockpit API wrappers for credit system access."""
 
     def __init__(self, cockpit_url: str, cockpit_token: str,
-                 node_id: str = "", default_policy: dict = None):
+                 node_id: str = "", default_policy: dict = None,
+                 query_receipts_fn: Callable = None):
         self._url = cockpit_url
         self._token = cockpit_token
         self._node_id = node_id
+        self._query_receipts_fn = query_receipts_fn
         # Default credit policy for threshold calculation
         self._initial_credit = float((default_policy or {}).get("initial_credit", 100))
         self._min_balance = float((default_policy or {}).get("min_balance", -50))
@@ -78,7 +84,22 @@ class ThrallCommerce:
         return self._get("/api/economy")
 
     def query_receipt(self, reference: str) -> Optional[dict]:
-        """Fetch credit note by job_id reference."""
+        """Fetch credit note by job_id reference.
+
+        Uses PluginContext.query_receipts() when available (v0.35.0+),
+        falls back to cockpit HTTP.
+        """
+        if self._query_receipts_fn:
+            try:
+                results = self._query_receipts_fn(
+                    document_type=None, counterparty=None,
+                    since=None, limit=50)
+                for r in results:
+                    if r.get("order_ref") == reference:
+                        return r
+            except Exception as e:
+                logger.debug(f"query_receipts_fn failed, falling back to HTTP: {e}")
+
         result = self._get(f"/api/receipts/{reference}")
         if isinstance(result, dict) and "error" not in result:
             return result
@@ -131,8 +152,8 @@ class ThrallCommerce:
 
     def build_netting_doc(self, peer_pk: str, settle_amount: float,
                           current_balance: float, target_balance: float,
-                          identity) -> str:
-        """Build a signed netting proposal document.
+                          identity) -> dict:
+        """Build a signed netting proposal document (eddsa-jcs-2022).
 
         Args:
             peer_pk: Peer's public key hex.
@@ -142,7 +163,7 @@ class ThrallCommerce:
             identity: ThrallIdentity instance for signing.
 
         Returns:
-            Signed JSON string.
+            Signed dict with embedded proof object.
         """
         payload = {
             "type": "thrall_netting_proposal",
@@ -159,7 +180,7 @@ class ThrallCommerce:
         logger.info(f"NETTING_DOC peer={peer_pk[:16]} amount={settle_amount:.1f}")
         return signed
 
-    def submit_settlement(self, peer_pk: str, doc: str,
+    def submit_settlement(self, peer_pk: str, doc: dict,
                           send_mail_fn: Callable) -> bool:
         """Submit settlement proposal via knarr-mail.
 
@@ -170,7 +191,7 @@ class ThrallCommerce:
         try:
             body = {
                 "type": "knarr/commerce/settle_request",
-                "proposal": json.loads(doc),
+                "proposal": doc,
             }
             send_mail_fn(peer_pk, "knarr/commerce/settle_request", body)
             logger.info(f"SETTLEMENT_SUBMITTED peer={peer_pk[:16]}")

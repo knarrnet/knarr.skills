@@ -5,14 +5,15 @@ Peers can distinguish "thrall signed this" from "the operator signed this."
 
 The 32-byte seed is stored in a keyfile inside the plugin directory.
 Config-gated: only initializes if [config.thrall.identity] enabled = true.
+
+v3.3.1: Aligned with v0.35.0 eddsa-jcs-2022 signing format (D-058).
+Uses knarr.core.proof.sign_document() with verification_method
+did:knarr:{node_id}#thrall-1 to distinguish from node signatures (#key-1).
 """
 
-import base64
-import json
 import logging
 import os
 import secrets
-from datetime import datetime, timezone
 
 logger = logging.getLogger("thrall.identity")
 
@@ -20,11 +21,13 @@ logger = logging.getLogger("thrall.identity")
 class ThrallIdentity:
     """Delegated Ed25519 identity for autonomous thrall operations."""
 
-    def __init__(self, plugin_dir: str, config: dict):
+    def __init__(self, plugin_dir: str, config: dict, node_id: str = ""):
         self._plugin_dir = plugin_dir
         self._enabled = config.get("enabled", False)
         self._signing_key = None
         self._public_key_hex = ""
+        self._node_id = node_id
+        self._verification_method = f"did:knarr:{node_id}#thrall-1" if node_id else ""
 
         if not self._enabled:
             logger.info("IDENTITY_DISABLED — no delegated keypair")
@@ -65,23 +68,21 @@ class ThrallIdentity:
             self._public_key_hex = self._signing_key.verify_key.encode().hex()
         return self._public_key_hex
 
-    def sign_document(self, payload: dict) -> str:
-        """Sign a document using canonical JSON + Ed25519.
+    def sign_document(self, payload: dict) -> dict:
+        """Sign a document using eddsa-jcs-2022 (RFC 8785 + Ed25519).
 
-        Follows the same pattern as knarr/commerce/receipts.py:create_credit_note().
-        Returns canonical JSON string with 'signature' field appended.
+        Uses knarr.core.proof.sign_document() for format compliance with
+        v0.35.0 receipt architecture. Returns a NEW dict with embedded
+        proof object. Does NOT mutate the input.
 
         Raises RuntimeError if identity is disabled.
         """
         if not self._signing_key:
             raise RuntimeError("Thrall identity not initialized")
 
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        raw_sig = self._signing_key.sign(canonical).signature
-        sig_b64 = base64.b64encode(raw_sig).decode("ascii")
-
-        payload["signature"] = sig_b64
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        from knarr.core.proof import sign_document
+        return sign_document(
+            payload, self._signing_key, self._verification_method)
 
     def revoke(self):
         """Delete the keyfile — operator escape hatch."""
@@ -93,27 +94,24 @@ class ThrallIdentity:
         self._enabled = False
 
 
-def verify_thrall_signature(doc_json: str) -> bool:
-    """Verify a thrall-signed document.
+def verify_thrall_signature(secured_document: dict) -> bool:
+    """Verify a thrall-signed document (eddsa-jcs-2022 format).
 
-    Expects 'thrall_public_key' and 'signature' fields in the JSON.
+    Expects a 'proof' object with verificationMethod containing a
+    thrall_public_key field in the document body. Falls back to
+    extracting thrall_public_key from the document itself.
+
     Returns True if signature is valid, False otherwise.
     """
     try:
         from nacl.signing import VerifyKey
+        from knarr.core.proof import verify_document
 
-        doc = json.loads(doc_json)
-        sig_b64 = doc.get("signature")
-        pk_hex = doc.get("thrall_public_key")
-        if not sig_b64 or not pk_hex:
+        pk_hex = secured_document.get("thrall_public_key")
+        if not pk_hex:
             return False
 
-        sig = base64.b64decode(sig_b64)
-        payload = {k: v for k, v in doc.items() if k != "signature"}
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
         vk = VerifyKey(bytes.fromhex(pk_hex))
-        vk.verify(canonical, sig)
-        return True
+        return verify_document(secured_document, vk)
     except Exception:
         return False

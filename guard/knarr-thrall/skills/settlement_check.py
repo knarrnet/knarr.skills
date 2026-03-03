@@ -85,7 +85,8 @@ async def handle(input_data: dict) -> dict:
 
     # Initialize components
     db = ThrallDB(os.path.join(plugin_dir, "thrall.db"))
-    identity = ThrallIdentity(plugin_dir, identity_cfg)
+    node_id = NODE.node_info.node_id if NODE else ""
+    identity = ThrallIdentity(plugin_dir, identity_cfg, node_id=node_id)
     wallet = ThrallWallet(db, wallet_cfg)
     cockpit_url = thrall_cfg.get("cockpit_url", "http://127.0.0.1:8080")
     cockpit_token = thrall_cfg.get("cockpit_token", "")
@@ -94,9 +95,6 @@ async def handle(input_data: dict) -> dict:
         return {"status": "disabled",
                 "result_summary": "Thrall identity failed to initialize",
                 "wall_ms": str(int((time.time() - t0) * 1000))}
-
-    # Get node_id from NODE if available
-    node_id = NODE.node_info.node_id if NODE else ""
 
     # Policy defaults (from knarr.toml, fallback to sensible defaults)
     policy = config.get("policy", {})
@@ -150,7 +148,7 @@ async def handle(input_data: dict) -> dict:
         if NODE and hasattr(NODE, "send_mail"):
             body = {
                 "type": "knarr/commerce/settle_request",
-                "proposal": json.loads(doc),
+                "proposal": doc,
             }
             try:
                 await NODE.send_mail(

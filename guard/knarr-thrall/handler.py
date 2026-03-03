@@ -167,12 +167,14 @@ class ThrallPlugin(PluginHooks):
         # Settlement identity — delegated keypair + scoped wallet + commerce
         identity_cfg = thrall_cfg.get("identity", {})
         wallet_cfg = thrall_cfg.get("wallet", {})
-        self.identity = ThrallIdentity(self._plugin_dir, identity_cfg)
+        self.identity = ThrallIdentity(self._plugin_dir, identity_cfg,
+                                        node_id=ctx.node_id)
         self.wallet = ThrallWallet(self.db, wallet_cfg) if self.identity.enabled else None
         self.commerce = ThrallCommerce(
             cockpit_url=self._cockpit_url,
             cockpit_token=self._cockpit_token,
             node_id=ctx.node_id,
+            query_receipts_fn=getattr(ctx, "query_receipts", None),
         ) if self.identity.enabled else None
 
         # Compilation config
