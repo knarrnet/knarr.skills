@@ -1,6 +1,6 @@
 # knarr-thrall: Autonomous Switchboard Plugin
 
-**Version**: 3.3.0
+**Version**: 3.4.0
 **Requires**: knarr >= 0.35.0, PyNaCl
 
 ## What is thrall?
@@ -9,13 +9,13 @@ Thrall is a **plugin** that gives your knarr node autonomous intelligence. It in
 
 **Core pipeline:**
 ```
-Inbound -> TRIGGER -> FILTER -> EVALUATE -> ACTION -> Journal
-            on_mail    trust     L1->L2     drop/log
-            on_event   tiers     cascade    compile
-            on_tick    rate      hotwire    wake/summon
-                       limit               act (skill)
-                       cache               reply
-                       cooldown
+Inbound -> TRIGGER -> FILTER -> GATHER -> EVALUATE -> ACTION -> Journal/Memory
+            on_mail    trust     cockpit    L1->L2     drop/log
+            on_event   tiers     memory     cascade    compile
+            on_tick    rate      static     hotwire    wake/summon
+                       limit                           act (skill)
+                       cache                           reply
+                       cooldown                        settle
 ```
 
 ## Architecture
@@ -62,7 +62,33 @@ input = {}
 error_buffer = "health-errors"
 ```
 
-### Included Recipes (15)
+### Context Gather Stage (v3.4.0)
+
+New pipeline stage between FILTER and EVALUATE. Fetches contextual data before the LLM decides:
+
+```toml
+[[gather]]
+name = "positions"
+source = "cockpit"
+endpoint = "/api/positions"
+
+[[gather]]
+name = "peer_history"
+source = "memory"
+query = { node_id = "{{peer_pk}}", limit = "5" }
+```
+
+Sources: `cockpit` (HTTP to cockpit API), `memory` (structured decision history), `static` (literal values).
+
+### Structured Memory (v3.4.0)
+
+Classified decision memory replacing unstructured journals. Every record tagged with skill, node_id, outcome for targeted recall.
+
+- Query: "Last 5 settlements with peer X", "Rejection rate for skill Y"
+- Dryrun isolation: `dryrun=1` records excluded from operational queries
+- Two consumers: recipes (via gather stage) and agent plugin (via DB)
+
+### Included Recipes (18)
 
 | Recipe | Trigger | Eval | Purpose |
 |--------|---------|------|---------|
@@ -80,9 +106,11 @@ error_buffer = "health-errors"
 | `chat` | on_mail | llm | Conversational chat |
 | `concierge-intake` | on_mail | llm | Service intake classification |
 | `concierge-faq` | on_mail | llm | FAQ auto-response |
-| `concierge-expert` | on_mail | llm | Expert routing |
+| `concierge-expert` | on_mail | llm | Expert routing with gather |
+| `settlement-review` | on_mail | llm+gather | Inbound settlement review with memory |
+| `inbound-settlement` | on_mail | hotwire | Settle_request message handler |
 
-### Included Prompts (6)
+### Included Prompts (7)
 
 | Prompt | Used by | Purpose |
 |--------|---------|---------|
@@ -92,6 +120,7 @@ error_buffer = "health-errors"
 | `concierge-intake` | concierge | Service intake |
 | `concierge-faq` | concierge | FAQ matching |
 | `concierge-expert` | concierge | Expert analysis |
+| `greeter` | greeter demo | Peer assessment [DEMO] |
 
 ## Settlement Identity (v3.3.0)
 
@@ -139,12 +168,11 @@ your-node/
   plugins/
     06-thrall/
       handler.py, engine.py, evaluate.py, backends.py,
-      actions.py, db.py, loader.py, identity.py, wallet.py,
-      commerce.py, __init__.py, plugin.toml
-      recipes/           # 15 recipe TOML files
-      prompts/           # 6 prompt TOML files
-  skills/
-    settlement_check.py  # settlement skill handler
+      thrall_actions.py, gather.py, memory.py, db.py,
+      loader.py, identity.py, wallet.py, commerce.py,
+      __init__.py, plugin.toml
+      recipes/           # 18 recipe TOML files
+      prompts/           # 7 prompt TOML files
 ```
 
 ### 2. Get model files
@@ -202,10 +230,10 @@ Expected log output:
 ```
 INFO thrall.loader: Recipe loaded: mail-triage (mode=automated)
 INFO thrall.loader: Recipe loaded: settlement-check (mode=automated)
-INFO thrall.engine: Loaded 15 recipes
+INFO thrall.engine: Loaded 18 recipes
 INFO thrall.identity: IDENTITY_LOADED public_key=b84d1bc2...
 INFO thrall.wallet: WALLET_INIT ceiling=50.0 daily_spent=0.0 remaining=50.0
-INFO knarr.dht.plugins: Loaded plugin: knarr-thrall v3.3.0
+INFO knarr.dht.plugins: Loaded plugin: knarr-thrall v3.4.0
 ```
 
 ## Trust Tiers
@@ -221,24 +249,25 @@ known = ["d9196be699447a12"]   # trusted peers — LLM classifies, lower bar
 
 ### Core
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `handler.py` | 685 | Plugin entry, hooks, bus consumer, sentinel reload, backend hot-swap |
-| `engine.py` | 403 | Pipeline engine (TRIGGER->FILTER->EVALUATE->ACTION), cooldown template vars |
-| `evaluate.py` | 335 | LLM orchestrator, L1/L2 cascade, cost tracker, prompt rendering |
-| `backends.py` | 310 | LocalBackend, OllamaBackend, OpenAIBackend + factory |
-| `actions.py` | 393 | Action executor (log, compile, wake, act, reply) |
-| `db.py` | 343 | ThrallDB (SQLite: journal, buffers, context, cache, wallet) |
-| `loader.py` | 82 | Recipe/prompt TOML loader (auto-discovers *.toml) |
+| File | Purpose |
+|------|---------|
+| `handler.py` | Plugin entry, hooks, bus consumer, subsystem init, pipeline orchestration |
+| `engine.py` | Pipeline engine (TRIGGER->FILTER->GATHER->EVALUATE->ACTION) |
+| `evaluate.py` | LLM orchestrator, L1/L2 cascade, cost tracker, prompt rendering |
+| `backends.py` | LocalBackend, OllamaBackend, OpenAIBackend + factory |
+| `thrall_actions.py` | Action executor (log, compile, wake, act, reply, settle, memory) |
+| `gather.py` | Context gatherer (cockpit, memory, static sources) |
+| `memory.py` | Structured decision memory (tagged records, filtered queries) |
+| `db.py` | ThrallDB (SQLite: journal, buffers, context, cache, memory, wallet) |
+| `loader.py` | Recipe/prompt TOML loader (auto-discovers *.toml) |
 
 ### Settlement Identity (v3.3.0)
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `identity.py` | 119 | Delegated Ed25519 keypair, sign_document, verify, revoke |
-| `wallet.py` | 68 | Scoped daily ceiling, can_spend/record_spend |
-| `commerce.py` | 180 | Cockpit API wrappers, position check, netting doc builder |
-| `skills/settlement_check.py` | 189 | Standalone skill handler for settlement-check-lite |
+| File | Purpose |
+|------|---------|
+| `identity.py` | Delegated Ed25519 keypair, eddsa-jcs-2022 signing, revocable |
+| `wallet.py` | Scoped daily ceiling, can_spend/record_spend |
+| `commerce.py` | Cockpit API wrappers, position check, netting doc builder |
 
 ## Database
 
@@ -250,6 +279,7 @@ Thrall uses its own `thrall.db` (SQLite, in the plugin directory):
 | `thrall_buffers` | Compilation buffers for batch processing |
 | `thrall_context` | Conversation context per sender |
 | `thrall_cache` | Response cache (dedup) |
+| `thrall_memory` | Structured decision records (v3.4.0) |
 | `thrall_wallet` | Settlement spending ledger (v3.3.0) |
 
 ## Dry Run Mode
