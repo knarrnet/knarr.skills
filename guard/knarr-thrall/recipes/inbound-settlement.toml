@@ -1,0 +1,45 @@
+# Inbound settlement — evaluate incoming settle_request from peer.
+#
+# v0.36.0 PluginHook: on_inbound_settlement
+# Called by the node when a remote peer sends a settlement request.
+#
+# Hotwire path: accept if request is well-formed (default).
+# LLM path:     evaluate if positions diverge beyond tolerance.
+#
+# Returns: True (accept) or False (reject).
+# Decision recorded in structured memory for future context.
+
+mode = "automated"
+
+[trigger]
+type = "on_inbound_settlement"
+
+[filter]
+cooldown_key = "inbound-settlement:{{peer_pk}}"
+cooldown_seconds = 60     # 1 min per peer (prevent spam)
+
+# Context gatherers — peer credit history for informed decisions
+[[gather]]
+name = "peer_history"
+source = "memory"
+format = "summary"
+[gather.query]
+node_id = "{{peer_pk}}"
+days = "30"
+
+[[gather]]
+name = "positions"
+source = "cockpit"
+endpoint = "/api/ledger"
+
+[evaluate]
+type = "hotwire"
+
+# Default: accept (settlements are generally beneficial)
+default_action = "accept"
+
+[actions.accept]
+skill = ""
+
+[actions.reject]
+skill = ""

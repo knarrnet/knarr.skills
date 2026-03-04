@@ -1,6 +1,6 @@
 """Thrall Switchboard — Pipeline execution engine.
 
-Runs: TRIGGER → FILTER → EVALUATE → ACTION
+Runs: TRIGGER → FILTER → GATHER → EVALUATE → ACTION
 Each stage is a pure function that takes an envelope and recipe config.
 The engine orchestrates the flow and writes to the journal.
 """
@@ -75,10 +75,12 @@ class PipelineResult:
 class PipelineEngine:
     """Executes recipes against envelopes. Stateless except for DB writes."""
 
-    def __init__(self, db: ThrallDB, evaluator: Any = None, action_executor: Any = None):
+    def __init__(self, db: ThrallDB, evaluator: Any = None,
+                 action_executor: Any = None, gatherer: Any = None):
         self.db = db
         self._evaluator = evaluator
         self._action_executor = action_executor
+        self._gatherer = gatherer  # ContextGatherer for pre-prompt data
         self._recipes: Dict[str, dict] = {}
         self._trust_tiers: Dict[str, str] = {}  # node_prefix → tier
 
@@ -163,6 +165,18 @@ class PipelineEngine:
             self._journal(result)
             return result
 
+        # ── GATHER ──
+        if self._gatherer and recipe.get("gather"):
+            try:
+                gathered = await self._gatherer.gather(recipe, envelope)
+                for k, v in gathered.items():
+                    if isinstance(v, str):
+                        envelope.fields[f"gather.{k}"] = v
+                    else:
+                        envelope.fields[f"gather.{k}"] = json.dumps(v)
+            except Exception as e:
+                logger.warning(f"[{recipe_name}] GATHER failed: {e}")
+
         # ── EVALUATE ──
         from_node = envelope.get("from_node", "")
         tag = f"[{recipe_name}:{from_node[:8]}]"
@@ -232,6 +246,13 @@ class PipelineEngine:
         # Trust tier resolution
         result.tier = self.resolve_tier(from_node)
         logger.debug(f"{tag} FILTER trust_tier={result.tier}")
+
+        # Blocked tier — drop before any evaluation
+        if result.tier == "blocked":
+            result.decision = "skip"
+            result.reason = "blocked by trust tier"
+            logger.debug(f"{tag} FILTER → skip (blocked)")
+            return result
 
         # Trust bypass — team nodes skip LLM
         if filter_cfg.get("trust_bypass") and result.tier == "team":

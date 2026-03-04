@@ -33,6 +33,8 @@ from loader import load_all
 from identity import ThrallIdentity
 from wallet import ThrallWallet
 from commerce import ThrallCommerce
+from memory import ThrallMemory
+from gather import ContextGatherer
 
 logger = logging.getLogger("thrall")
 
@@ -134,11 +136,18 @@ class ThrallPlugin(PluginHooks):
             plugin_dir=self._plugin_dir,
         )
 
-        # Initialize engine
+        # Initialize structured memory
+        self.memory = ThrallMemory(self.db)
+
+        # Initialize context gatherer (pre-prompt data fetching)
+        self.gatherer = ContextGatherer()
+
+        # Initialize engine (with gatherer for [[gather]] recipe stages)
         self.engine = PipelineEngine(
             db=self.db,
             evaluator=self.evaluator,
             action_executor=self.actions,
+            gatherer=self.gatherer,
         )
 
         # Set trust tiers
@@ -176,6 +185,11 @@ class ThrallPlugin(PluginHooks):
             node_id=ctx.node_id,
             query_receipts_fn=getattr(ctx, "query_receipts", None),
         ) if self.identity.enabled else None
+
+        # Wire commerce + memory into gatherer for [[gather]] recipe stages
+        if self.commerce:
+            self.gatherer.set_commerce(self.commerce)
+        self.gatherer.set_memory(self.memory)
 
         # Compilation config
         compile_cfg = config.get("compilation", {})
@@ -335,6 +349,130 @@ class ThrallPlugin(PluginHooks):
             self._log.error(f"Tick failed: {e}")
         finally:
             self._processing = False
+
+    async def on_settlement_review(self, prepared_tx: dict) -> Optional[dict]:
+        """v0.36.0 PluginHook: review a settlement_prepared document.
+
+        Called by the node when a settlement is prepared and needs authority
+        review. Returns a countersigned document (approve) or None (reject).
+
+        Routes through settlement-review recipe for hotwire/LLM decision.
+        Records outcome in structured memory.
+        """
+        if not self._enabled or not self.identity or not self.identity.enabled:
+            return None
+
+        peer_pk = prepared_tx.get("counterparty", "")
+        proposal = prepared_tx.get("proposal", {})
+        positions = prepared_tx.get("positions", {})
+        amount = float(proposal.get("amount", 0))
+        utilization = float(positions.get("utilization_pct", 0))
+
+        # Pre-compute decision flags for hotwire rules
+        wallet_ok = self.wallet.can_spend(amount) if self.wallet else False
+        util_high = utilization > 80
+
+        envelope = Envelope(
+            trigger_type="on_settlement_review",
+            timestamp=time.time(),
+            fields={
+                "peer_pk": peer_pk,
+                "amount": str(amount),
+                "utilization_pct": str(utilization),
+                "wallet_ok": "true" if wallet_ok else "false",
+                "util_high": "true" if util_high else "false",
+                "affordable_and_high_util": "true" if (wallet_ok and util_high) else "false",
+                "prepared_tx_json": json.dumps(prepared_tx),
+                "document_type": "settlement_prepared",
+            },
+        )
+
+        matched = self.engine.match_recipes("on_settlement_review", envelope)
+        if not matched:
+            self._log.warning("No recipe matched on_settlement_review")
+            return None
+
+        for recipe_name in matched:
+            try:
+                result = await self.engine.run(recipe_name, envelope)
+                action = result.eval_result.action
+                reason = result.eval_result.reason
+
+                if action in ("approve", "act"):
+                    # Countersign with thrall identity
+                    signed = self.identity.sign_document(prepared_tx)
+                    if self.wallet:
+                        self.wallet.record_spend(amount, f"settlement:{peer_pk[:16]}", peer_pk)
+                    self.memory.record(
+                        skill="settlement-review", node_id=peer_pk,
+                        outcome="approved", amount=amount, reasoning=reason)
+                    self._log.info(f"SETTLEMENT_REVIEW approved: peer={peer_pk[:16]} "
+                                   f"amount={amount:.1f} reason={reason}")
+                    return signed
+                else:
+                    self.memory.record(
+                        skill="settlement-review", node_id=peer_pk,
+                        outcome="rejected", amount=amount, reasoning=reason)
+                    self._log.info(f"SETTLEMENT_REVIEW rejected: peer={peer_pk[:16]} "
+                                   f"amount={amount:.1f} reason={reason}")
+                    return None
+            except Exception as e:
+                self._log.error(f"Settlement review failed: {e}")
+                return None
+
+        return None
+
+    async def on_inbound_settlement(self, settle_request: dict,
+                                     sender_pk: str) -> bool:
+        """v0.36.0 PluginHook: evaluate an inbound settle_request.
+
+        Called by the node when a remote peer sends a settlement request.
+        Returns True (accept) or False (reject).
+
+        Routes through inbound-settlement recipe for hotwire/LLM decision.
+        """
+        if not self._enabled:
+            return False
+
+        proposal = settle_request.get("proposal", {})
+        amount = float(proposal.get("amount", 0))
+
+        envelope = Envelope(
+            trigger_type="on_inbound_settlement",
+            timestamp=time.time(),
+            fields={
+                "peer_pk": sender_pk,
+                "amount": str(amount),
+                "settle_request_json": json.dumps(settle_request),
+                "document_type": "settle_request",
+            },
+        )
+
+        matched = self.engine.match_recipes("on_inbound_settlement", envelope)
+        if not matched:
+            self._log.info("No recipe for on_inbound_settlement, defaulting to accept")
+            return True
+
+        for recipe_name in matched:
+            try:
+                result = await self.engine.run(recipe_name, envelope)
+                action = result.eval_result.action
+                reason = result.eval_result.reason
+                accepted = action in ("accept", "approve", "act")
+
+                self.memory.record(
+                    skill="inbound-settlement", node_id=sender_pk,
+                    outcome="accepted" if accepted else "rejected",
+                    amount=amount, reasoning=reason)
+
+                self._log.info(f"INBOUND_SETTLEMENT {'accepted' if accepted else 'rejected'}: "
+                               f"peer={sender_pk[:16]} amount={amount:.1f} reason={reason}")
+                return accepted
+            except Exception as e:
+                self._log.error(f"Inbound settlement eval failed: {e}")
+                return False
+
+        return False
 
     async def on_shutdown(self) -> None:
         """Graceful shutdown."""

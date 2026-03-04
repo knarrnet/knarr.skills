@@ -4,6 +4,10 @@
 #
 # Hotwire only — no LLM. Pure computation (ledger query + signing).
 # Cooldown: 1 hour — positions change slowly.
+#
+# v3.4: Gathers position + settlement history via context gatherers
+# before executing. When v0.36.0 ships, this routes through the
+# review_settlement flow instead of direct execution.
 
 mode = "automated"
 
@@ -13,6 +17,21 @@ type = "on_tick"
 [filter]
 cooldown_key = "settlement-check"
 cooldown_seconds = 3600    # hourly
+
+# Gather current positions + recent settlement history
+[[gather]]
+name = "positions"
+source = "cockpit"
+endpoint = "/api/positions"
+threshold = "0.7"
+
+[[gather]]
+name = "recent_settlements"
+source = "memory"
+format = "prompt"
+[gather.query]
+skill = "settlement-review"
+limit = "10"
 
 [evaluate]
 type = "hotwire"

@@ -5,6 +5,7 @@ Tables:
 - thrall_context: async workflow state (session continuations, flags)
 - thrall_recipes: runtime cache of loaded recipe configs
 - thrall_wallet: delegated spending ledger (settlement identity)
+- thrall_memory: classified decision memory (skill, node_id, outcome)
 """
 
 import json
@@ -83,6 +84,22 @@ class ThrallDB:
                 description TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_wallet_ts ON thrall_wallet(timestamp);
+
+            CREATE TABLE IF NOT EXISTS thrall_memory (
+                id            INTEGER PRIMARY KEY,
+                timestamp     REAL NOT NULL,
+                skill         TEXT NOT NULL,
+                node_id       TEXT NOT NULL DEFAULT '',
+                mail_id       TEXT NOT NULL DEFAULT '',
+                outcome       TEXT NOT NULL,
+                amount        REAL DEFAULT 0.0,
+                reasoning     TEXT DEFAULT '',
+                metadata_json TEXT,
+                dryrun        INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_skill ON thrall_memory(skill);
+            CREATE INDEX IF NOT EXISTS idx_memory_node ON thrall_memory(node_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_ts ON thrall_memory(timestamp);
         """)
 
         # Migration: add from_node column for fast rate-limit / cache queries
@@ -297,6 +314,57 @@ class ThrallDB:
             "WHERE timestamp >= ?", (day_start,)
         ).fetchone()
         return row["total"]
+
+    # ── Memory ──
+
+    def record_memory(self, skill: str, node_id: str, outcome: str,
+                      mail_id: str = "", amount: float = 0.0,
+                      reasoning: str = "", metadata: dict = None,
+                      dryrun: bool = False) -> int:
+        cur = self._conn.execute("""
+            INSERT INTO thrall_memory
+                (timestamp, skill, node_id, mail_id, outcome,
+                 amount, reasoning, metadata_json, dryrun)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            time.time(), skill, node_id[:64], mail_id, outcome,
+            amount, reasoning,
+            json.dumps(metadata) if metadata else None,
+            1 if dryrun else 0,
+        ))
+        self._conn.commit()
+        return cur.lastrowid
+
+    def query_memory(self, node_id: str = None, skill: str = None,
+                     outcome: str = None, limit: int = 10,
+                     since: float = None,
+                     include_dryrun: bool = False) -> List[dict]:
+        sql = "SELECT * FROM thrall_memory WHERE 1=1"
+        params: list = []
+        if not include_dryrun:
+            sql += " AND dryrun = 0"
+        if node_id:
+            sql += " AND node_id = ?"
+            params.append(node_id[:64])
+        if skill:
+            sql += " AND skill = ?"
+            params.append(skill)
+        if outcome:
+            sql += " AND outcome = ?"
+            params.append(outcome)
+        if since:
+            sql += " AND timestamp > ?"
+            params.append(since)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get("metadata_json"):
+                d["metadata"] = json.loads(d["metadata_json"])
+            result.append(d)
+        return result
 
     # ── Stats ──
 
