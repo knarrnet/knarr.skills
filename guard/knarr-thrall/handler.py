@@ -27,7 +27,7 @@ from knarr.core.models import NodeInfo
 from db import ThrallDB
 from evaluate import Evaluator
 from backends import create_backend
-from actions import ActionExecutor
+from thrall_actions import ActionExecutor
 from engine import PipelineEngine, Envelope
 from loader import load_all
 from identity import ThrallIdentity
