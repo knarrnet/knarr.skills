@@ -41,12 +41,13 @@ class ActionExecutor:
 
     def __init__(self, db: ThrallDB, send_mail_fn: Callable = None,
                  call_skill_fn: Callable = None, summon_fn: Callable = None,
-                 plugin_dir: str = ""):
+                 plugin_dir: str = "", commerce=None):
         self.db = db
         self._send_mail = send_mail_fn
         self._call_skill = call_skill_fn
         self._summon = summon_fn
         self._plugin_dir = plugin_dir
+        self._commerce = commerce
         # Compilation flush state
         self._buffer_timers: Dict[str, float] = {}  # buffer_name -> last_flush_time
 
@@ -76,6 +77,15 @@ class ActionExecutor:
 
         elif action == "reply":
             return await self._do_reply(envelope, eval_result, actions_cfg)
+
+        elif action == "wm_approve":
+            return await self._do_wm_approve(envelope, eval_result, actions_cfg)
+
+        elif action == "wm_reject":
+            return await self._do_wm_reject(envelope, eval_result, actions_cfg)
+
+        elif action == "execute_settlement":
+            return await self._do_execute_settlement(envelope, eval_result, actions_cfg)
 
         else:
             # Unknown action — treat as log
@@ -387,6 +397,95 @@ class ActionExecutor:
             return ActionResult("reply", f"replied to {to_node[:16]}")
         except Exception as e:
             return ActionResult("reply", f"error: {e}")
+
+
+    async def _do_wm_approve(self, envelope: Any, eval_result: Any,
+                              actions_cfg: dict) -> Any:
+        """Approve a document held in WM quarantine."""
+        from engine import ActionResult
+
+        doc_id = envelope.get("document_id", "")
+        if not doc_id:
+            return ActionResult("wm_approve", "no document_id in envelope")
+
+        if not self._call_skill:
+            return ActionResult("wm_approve", f"would approve {doc_id} (no executor)")
+
+        try:
+            from commerce import ThrallCommerce
+            commerce = getattr(self, "_commerce", None)
+            if not commerce:
+                # Fall back to cockpit API directly
+                result = await self._call_skill("knarr-mail", {
+                    "action": "wm_approve", "document_id": doc_id})
+            else:
+                result = commerce.approve_quarantine(doc_id)
+            logger.info(f"WM_APPROVE doc={doc_id[:16]} result={result}")
+            return ActionResult("wm_approve", f"approved {doc_id[:16]}")
+        except Exception as e:
+            logger.error(f"WM_APPROVE failed: {e}")
+            return ActionResult("wm_approve", f"error: {e}")
+
+    async def _do_wm_reject(self, envelope: Any, eval_result: Any,
+                             actions_cfg: dict) -> Any:
+        """Reject a document held in WM quarantine."""
+        from engine import ActionResult
+
+        doc_id = envelope.get("document_id", "")
+        reason = actions_cfg.get("reason", eval_result.reason)
+        if not doc_id:
+            return ActionResult("wm_reject", "no document_id in envelope")
+
+        if not self._call_skill:
+            return ActionResult("wm_reject", f"would reject {doc_id} (no executor)")
+
+        try:
+            from commerce import ThrallCommerce
+            commerce = getattr(self, "_commerce", None)
+            if not commerce:
+                result = await self._call_skill("knarr-mail", {
+                    "action": "wm_reject", "document_id": doc_id, "reason": reason})
+            else:
+                result = commerce.reject_quarantine(doc_id, reason)
+            logger.info(f"WM_REJECT doc={doc_id[:16]} reason={reason[:80]}")
+            return ActionResult("wm_reject", f"rejected {doc_id[:16]}: {reason[:80]}")
+        except Exception as e:
+            logger.error(f"WM_REJECT failed: {e}")
+            return ActionResult("wm_reject", f"error: {e}")
+
+    async def _do_execute_settlement(self, envelope: Any, eval_result: Any,
+                                      actions_cfg: dict) -> Any:
+        """Execute an on-chain settlement transfer (Solana devnet)."""
+        from engine import ActionResult
+
+        skill = actions_cfg.get("skill", "settlement-execute-lite")
+        if not self._call_skill:
+            return ActionResult("execute_settlement", f"would call {skill} (no executor)")
+
+        # Build skill input from envelope fields
+        skill_input = {
+            "peer_node_id": envelope.get("peer_node_id", ""),
+            "peer_public_key": envelope.get("peer_public_key", ""),
+            "settle_amount": envelope.get("settle_amount", "0"),
+        }
+        # Merge any explicit input from recipe config
+        for k, v in actions_cfg.get("input", {}).items():
+            if isinstance(v, str) and v.startswith("{{") and v.endswith("}}"):
+                field = v[2:-2].strip()
+                skill_input[k] = envelope.get(field, "")
+            else:
+                skill_input[k] = v
+
+        try:
+            result = await self._call_skill(skill, skill_input)
+            status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+            logger.info(f"EXECUTE_SETTLEMENT {skill}: status={status}")
+            return ActionResult("execute_settlement",
+                                f"skill={skill} status={status} "
+                                f"result={_truncate(str(result), 200)}")
+        except Exception as e:
+            logger.error(f"EXECUTE_SETTLEMENT {skill} failed: {e}")
+            return ActionResult("execute_settlement", f"error: {e}")
 
 
 def _truncate(s: str, maxlen: int) -> str:

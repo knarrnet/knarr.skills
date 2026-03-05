@@ -127,7 +127,7 @@ class ThrallPlugin(PluginHooks):
             l1_prompt=cascade_cfg.get("l1_prompt", "triage-l1"),
         )
 
-        # Initialize action executor
+        # Initialize action executor (commerce wired after identity init below)
         self.actions = ActionExecutor(
             db=self.db,
             send_mail_fn=self._send_mail,
@@ -186,8 +186,9 @@ class ThrallPlugin(PluginHooks):
             query_receipts_fn=getattr(ctx, "query_receipts", None),
         ) if self.identity.enabled else None
 
-        # Wire commerce + memory into gatherer for [[gather]] recipe stages
+        # Wire commerce into action executor and gatherer
         if self.commerce:
+            self.actions._commerce = self.commerce
             self.gatherer.set_commerce(self.commerce)
         self.gatherer.set_memory(self.memory)
 

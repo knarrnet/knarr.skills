@@ -35,10 +35,11 @@ def set_node(node):
 def _get_plugin_dir():
     """Resolve thrall plugin directory from skill file location.
 
-    settlement_check.py lives at <plugin_dir>/skills/settlement_check.py,
-    so two dirname() calls reach the plugin dir regardless of install layout.
+    Skills live at <provider>/skills/ but thrall config is at
+    <provider>/plugins/06-thrall/. Resolve relative to this file.
     """
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    provider_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(provider_root, "plugins", "06-thrall")
 
 
 def _get_config():

@@ -1,7 +1,7 @@
 # knarr-thrall: Autonomous Switchboard Plugin
 
-**Version**: 3.4.0
-**Requires**: knarr >= 0.35.0, PyNaCl
+**Version**: 3.5.0
+**Requires**: knarr >= 0.29.1 (tested up to v0.37.0), PyNaCl, base58 (optional)
 
 ## What is thrall?
 
@@ -88,7 +88,7 @@ Classified decision memory replacing unstructured journals. Every record tagged 
 - Dryrun isolation: `dryrun=1` records excluded from operational queries
 - Two consumers: recipes (via gather stage) and agent plugin (via DB)
 
-### Included Recipes (18)
+### Included Recipes (22)
 
 | Recipe | Trigger | Eval | Purpose |
 |--------|---------|------|---------|
@@ -109,6 +109,10 @@ Classified decision memory replacing unstructured journals. Every record tagged 
 | `concierge-expert` | on_mail | llm | Expert routing with gather |
 | `settlement-review` | on_mail | llm+gather | Inbound settlement review with memory |
 | `inbound-settlement` | on_mail | hotwire | Settle_request message handler |
+| `wm-review` | on_event | hotwire | WM quarantine document review (v3.5) |
+| `payment-received` | on_event | hotwire | BCW payment included in block (v3.5) |
+| `payment-finalized` | on_event | hotwire | BCW payment reached finality (v3.5) |
+| `settlement-execute` | on_event | hotwire | On-chain settlement execution (v3.5) |
 
 ### Included Prompts (7)
 
@@ -230,10 +234,10 @@ Expected log output:
 ```
 INFO thrall.loader: Recipe loaded: mail-triage (mode=automated)
 INFO thrall.loader: Recipe loaded: settlement-check (mode=automated)
-INFO thrall.engine: Loaded 18 recipes
+INFO thrall.engine: Loaded 22 recipes
 INFO thrall.identity: IDENTITY_LOADED public_key=b84d1bc2...
 INFO thrall.wallet: WALLET_INIT ceiling=50.0 daily_spent=0.0 remaining=50.0
-INFO knarr.dht.plugins: Loaded plugin: knarr-thrall v3.4.0
+INFO knarr.dht.plugins: Loaded plugin: knarr-thrall v3.5.0
 ```
 
 ## Trust Tiers
@@ -261,13 +265,14 @@ known = ["d9196be699447a12"]   # trusted peers — LLM classifies, lower bar
 | `db.py` | ThrallDB (SQLite: journal, buffers, context, cache, memory, wallet) |
 | `loader.py` | Recipe/prompt TOML loader (auto-discovers *.toml) |
 
-### Settlement Identity (v3.3.0)
+### Settlement Identity (v3.3.0) + On-chain Execution (v3.5.0)
 
 | File | Purpose |
 |------|---------|
-| `identity.py` | Delegated Ed25519 keypair, eddsa-jcs-2022 signing, revocable |
+| `identity.py` | Delegated Ed25519 keypair, eddsa-jcs-2022 signing, Solana address derivation, revocable |
 | `wallet.py` | Scoped daily ceiling, can_spend/record_spend |
-| `commerce.py` | Cockpit API wrappers, position check, netting doc builder |
+| `commerce.py` | Cockpit API wrappers, position check, netting doc builder, WM quarantine ops, Solana devnet RPC |
+| `skills/settlement_execute.py` | On-chain settlement execution skill (v3.5) |
 
 ## Database
 

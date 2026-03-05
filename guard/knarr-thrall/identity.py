@@ -68,6 +68,28 @@ class ThrallIdentity:
             self._public_key_hex = self._signing_key.verify_key.encode().hex()
         return self._public_key_hex
 
+    @property
+    def solana_address(self) -> str:
+        """Derive Solana address from thrall's Ed25519 public key.
+
+        Solana uses raw Ed25519 public keys as addresses (base58-encoded).
+        This gives thrall its own on-chain identity, separate from the node's.
+        """
+        if not self._signing_key:
+            return ""
+        try:
+            import base58
+            pk_bytes = self._signing_key.verify_key.encode()
+            return base58.b58encode(pk_bytes).decode()
+        except ImportError:
+            # base58 not available — return hex as fallback
+            return self.public_key_hex
+
+    @property
+    def signing_key(self):
+        """Access the raw signing key (for Solana transaction signing)."""
+        return self._signing_key
+
     def sign_document(self, payload: dict) -> dict:
         """Sign a document using eddsa-jcs-2022 (RFC 8785 + Ed25519).
 

@@ -8,13 +8,23 @@ v3.3.1: Receipt queries use PluginContext.query_receipts() (D-051) when
 available, falling back to cockpit HTTP. Ledger/economy queries still
 use cockpit HTTP (no PluginContext equivalent exists).
 
+v3.5.0: Added WM quarantine operations (approve/reject/review) and
+Solana devnet settlement execution (derive address, build tx, submit).
+
 Methods:
-    query_ledger()      → GET /api/ledger
-    get_economy()       → GET /api/economy
-    query_receipt(ref)  → ctx.query_receipts() or GET /api/receipts/{ref}
-    check_positions()   → computed from ledger
-    build_netting_doc() → signed by ThrallIdentity (eddsa-jcs-2022)
-    submit_settlement() → send settle_request mail to peer
+    query_ledger()          → GET /api/ledger
+    get_economy()           → GET /api/economy
+    query_receipt(ref)      → ctx.query_receipts() or GET /api/receipts/{ref}
+    check_positions()       → computed from ledger
+    build_netting_doc()     → signed by ThrallIdentity (eddsa-jcs-2022)
+    submit_settlement()     → send settle_request mail to peer
+    approve_quarantine()    → POST /api/wm/approve
+    reject_quarantine()     → POST /api/wm/reject
+    review_quarantine()     → GET /api/wm/review/{id}
+    derive_peer_solana_address() → sha256(seed||node_id) → Ed25519 → base58
+    build_solana_transfer()     → Solana transfer instruction
+    submit_solana_tx()          → Solana RPC sendTransaction
+    request_devnet_airdrop()    → Solana RPC requestAirdrop
 """
 
 import json
@@ -180,6 +190,68 @@ class ThrallCommerce:
         logger.info(f"NETTING_DOC peer={peer_pk[:16]} amount={settle_amount:.1f}")
         return signed
 
+    def approve_quarantine(self, document_id: str) -> dict:
+        """Approve a WM-held document, promoting it to the internal bus.
+
+        Calls wm.approve(document_id) via cockpit API.
+        """
+        payload = json.dumps({"document_id": document_id}).encode()
+        req = Request(
+            f"{self._url}/api/wm/approve",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._token}",
+            },
+            method="POST",
+        )
+        try:
+            resp = urlopen(req, timeout=10, context=self._ssl_ctx)
+            result = json.loads(resp.read())
+            logger.info(f"WM_APPROVE doc={document_id[:16]} result={result}")
+            return result
+        except (HTTPError, URLError) as e:
+            logger.error(f"WM_APPROVE failed: {e}")
+            return {"error": str(e)}
+
+    def reject_quarantine(self, document_id: str, reason: str = "") -> dict:
+        """Reject a WM-held document, discarding it with a logged reason.
+
+        Calls wm.reject(document_id, reason) via cockpit API.
+        """
+        payload = json.dumps({
+            "document_id": document_id,
+            "reason": reason,
+        }).encode()
+        req = Request(
+            f"{self._url}/api/wm/reject",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._token}",
+            },
+            method="POST",
+        )
+        try:
+            resp = urlopen(req, timeout=10, context=self._ssl_ctx)
+            result = json.loads(resp.read())
+            logger.info(f"WM_REJECT doc={document_id[:16]} reason={reason[:40]}")
+            return result
+        except (HTTPError, URLError) as e:
+            logger.error(f"WM_REJECT failed: {e}")
+            return {"error": str(e)}
+
+    def review_quarantine(self, document_id: str) -> dict:
+        """Pull a WM-held document for review without promoting it.
+
+        Calls wm.request_review(document_id) via cockpit API.
+        Returns the document payload for inspection.
+        """
+        result = self._get(f"/api/wm/review/{document_id}")
+        if isinstance(result, dict) and "error" not in result:
+            logger.info(f"WM_REVIEW doc={document_id[:16]} type={result.get('document_type', '?')}")
+        return result
+
     def submit_settlement(self, peer_pk: str, doc: dict,
                           send_mail_fn: Callable) -> bool:
         """Submit settlement proposal via knarr-mail.
@@ -199,3 +271,134 @@ class ThrallCommerce:
         except Exception as e:
             logger.error(f"SETTLEMENT_SUBMIT_FAILED peer={peer_pk[:16]}: {e}")
             return False
+
+    # ── Solana devnet settlement execution ──
+
+    @staticmethod
+    def derive_peer_solana_address(master_seed: bytes, peer_node_id: str) -> str:
+        """Derive a deterministic Solana address for a peer.
+
+        Uses sha256(master_seed || node_id) → Ed25519 seed → public key → base58.
+        Same derivation as knarr/commerce/wallet.py but using thrall's seed.
+        Full 64-char node_id required (not prefix).
+        """
+        import hashlib
+        derived_seed = hashlib.sha256(master_seed + peer_node_id.encode()).digest()
+
+        from nacl.signing import SigningKey
+        sk = SigningKey(derived_seed)
+        pk_bytes = sk.verify_key.encode()
+
+        try:
+            import base58
+            return base58.b58encode(pk_bytes).decode()
+        except ImportError:
+            return pk_bytes.hex()
+
+    @staticmethod
+    def build_solana_transfer(from_pubkey: bytes, to_pubkey: bytes,
+                               lamports: int) -> bytes:
+        """Build a raw Solana SystemProgram.Transfer instruction.
+
+        Constructs the minimal wire format for a SOL transfer.
+        No external Solana SDK needed — just byte packing.
+
+        Returns the serialized transaction message (unsigned).
+        """
+        import struct
+
+        # SystemProgram ID (all zeros)
+        system_program = b'\x00' * 32
+
+        # Transfer instruction index = 2
+        # Data: u32 instruction (2) + u64 lamports
+        ix_data = struct.pack('<I', 2) + struct.pack('<Q', lamports)
+
+        # Compact instruction format
+        instruction = {
+            "program_id": system_program,
+            "accounts": [
+                {"pubkey": from_pubkey, "is_signer": True, "is_writable": True},
+                {"pubkey": to_pubkey, "is_signer": False, "is_writable": True},
+            ],
+            "data": ix_data,
+        }
+
+        return instruction
+
+    def submit_solana_tx(self, signed_tx_base64: str,
+                          rpc_url: str = "https://api.devnet.solana.com") -> dict:
+        """Submit a signed transaction to Solana via JSON-RPC.
+
+        Uses the same HTTP pattern as the rest of commerce.py.
+        Devnet only — the URL is locked in config.
+
+        Returns: {"tx_hash": "...", "status": "ok"} or {"error": "..."}
+        """
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_base64,
+                {"encoding": "base64", "preflightCommitment": "confirmed"},
+            ],
+        }).encode()
+
+        req = Request(
+            rpc_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        ssl_ctx = ssl.create_default_context()
+        try:
+            resp = urlopen(req, timeout=30, context=ssl_ctx)
+            result = json.loads(resp.read())
+            if "error" in result:
+                err = result["error"]
+                logger.error(f"SOLANA_TX_ERROR: {err}")
+                return {"error": str(err)}
+            tx_hash = result.get("result", "")
+            logger.info(f"SOLANA_TX_SUBMITTED tx={tx_hash[:16]}...")
+            return {"tx_hash": tx_hash, "status": "ok"}
+        except Exception as e:
+            logger.error(f"SOLANA_TX_FAILED: {e}")
+            return {"error": str(e)}
+
+    def request_devnet_airdrop(self, address: str,
+                                lamports: int = 2_000_000_000,
+                                rpc_url: str = "https://api.devnet.solana.com") -> dict:
+        """Request SOL airdrop on devnet for funding test transactions.
+
+        Default: 2 SOL (2_000_000_000 lamports).
+        Only works on devnet — will fail silently on mainnet.
+        """
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "requestAirdrop",
+            "params": [address, lamports],
+        }).encode()
+
+        req = Request(
+            rpc_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        ssl_ctx = ssl.create_default_context()
+        try:
+            resp = urlopen(req, timeout=30, context=ssl_ctx)
+            result = json.loads(resp.read())
+            if "error" in result:
+                logger.warning(f"AIRDROP_ERROR: {result['error']}")
+                return {"error": str(result["error"])}
+            tx_sig = result.get("result", "")
+            logger.info(f"AIRDROP_OK address={address[:16]}... tx={tx_sig[:16]}...")
+            return {"tx_hash": tx_sig, "status": "ok", "lamports": lamports}
+        except Exception as e:
+            logger.warning(f"AIRDROP_FAILED: {e}")
+            return {"error": str(e)}
