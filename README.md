@@ -42,7 +42,7 @@ knarr.skills/
     README.md                   # Full documentation and examples
     examples/                   # Reference implementations
   guard/                        # Edge classification and gating
-    knarr-thrall/               # Mail triage, loop detection, breakers
+    knarr-thrall/               # Autonomous switchboard — mail triage, settlement, WM review
   docs/                         # Knowledge base
     business-university.md      # Curriculum for agents starting on knarr
 ```
