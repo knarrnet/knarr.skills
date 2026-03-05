@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from db import ThrallDB
+from engine import ActionResult
 
 logger = logging.getLogger("thrall.actions")
 
@@ -54,7 +55,7 @@ class ActionExecutor:
     async def execute(self, recipe: dict, envelope: Any,
                       eval_result: Any, filter_result: Any) -> Any:
         """Route to the appropriate action handler."""
-        from engine import ActionResult
+
 
         action = eval_result.action
         actions_cfg = recipe.get("actions", {}).get(action, {})
@@ -92,7 +93,7 @@ class ActionExecutor:
             return ActionResult(action, f"unknown action '{action}', logged")
 
     def _do_log(self, action: str, eval_result: Any, envelope: Any) -> Any:
-        from engine import ActionResult
+
         msg = f"{action}: {eval_result.reason} (from={envelope.get('from_node', '?')[:16]})"
         logger.info(f"THRALL {msg}")
         return ActionResult(action, msg)
@@ -100,7 +101,7 @@ class ActionExecutor:
     async def _do_compile(self, recipe: dict, envelope: Any,
                           eval_result: Any, actions_cfg: dict) -> Any:
         """Add to compilation buffer. Check if flush triggers fire."""
-        from engine import ActionResult
+
 
         buffer_name = actions_cfg.get("buffer", recipe.get("compile", {}).get("buffer", "default"))
         body_text = envelope.get("body_text", "")
@@ -165,7 +166,7 @@ class ActionExecutor:
                          eval_result: Any, filter_result: Any,
                          actions_cfg: dict) -> Any:
         """Immediate summon — self-contained briefing for single-shot response."""
-        from engine import ActionResult
+
 
         # Build rich briefing — everything the agent needs to respond
         briefing = {
@@ -310,7 +311,7 @@ class ActionExecutor:
     async def _do_act(self, envelope: Any, eval_result: Any,
                       actions_cfg: dict) -> Any:
         """Execute a skill directly — thrall handles end-to-end."""
-        from engine import ActionResult
+
 
         skill = actions_cfg.get("skill")
         if not skill:
@@ -371,7 +372,7 @@ class ActionExecutor:
     async def _do_reply(self, envelope: Any, eval_result: Any,
                         actions_cfg: dict) -> Any:
         """Send an auto-reply."""
-        from engine import ActionResult
+
 
         if not self._send_mail:
             return ActionResult("reply", "no send_mail_fn configured")
@@ -402,7 +403,7 @@ class ActionExecutor:
     async def _do_wm_approve(self, envelope: Any, eval_result: Any,
                               actions_cfg: dict) -> Any:
         """Approve a document held in WM quarantine."""
-        from engine import ActionResult
+
 
         doc_id = envelope.get("document_id", "")
         if not doc_id:
@@ -429,7 +430,7 @@ class ActionExecutor:
     async def _do_wm_reject(self, envelope: Any, eval_result: Any,
                              actions_cfg: dict) -> Any:
         """Reject a document held in WM quarantine."""
-        from engine import ActionResult
+
 
         doc_id = envelope.get("document_id", "")
         reason = actions_cfg.get("reason", eval_result.reason)
@@ -456,7 +457,7 @@ class ActionExecutor:
     async def _do_execute_settlement(self, envelope: Any, eval_result: Any,
                                       actions_cfg: dict) -> Any:
         """Execute an on-chain settlement transfer (Solana devnet)."""
-        from engine import ActionResult
+
 
         skill = actions_cfg.get("skill", "settlement-execute-lite")
         if not self._call_skill:
