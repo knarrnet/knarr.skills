@@ -257,6 +257,17 @@ class ThrallDB:
             result.append(d)
         return result
 
+    def prune_recipes(self, keep_names: List[str]) -> int:
+        """Delete DB rows for recipes not in keep_names. Returns count pruned."""
+        if not keep_names:
+            return 0
+        placeholders = ",".join("?" for _ in keep_names)
+        cur = self._conn.execute(
+            f"DELETE FROM thrall_recipes WHERE name NOT IN ({placeholders})",
+            keep_names)
+        self._conn.commit()
+        return cur.rowcount
+
     # ── Compilation buffer ──
 
     def add_to_buffer(self, buffer_name: str, entry: dict, pipeline: str) -> int:
@@ -314,6 +325,16 @@ class ThrallDB:
             "WHERE timestamp >= ?", (day_start,)
         ).fetchone()
         return row["total"]
+
+    def get_wallet_history(self, since: float = None, limit: int = 50) -> List[dict]:
+        """Return wallet spending records since timestamp (default: last 24h)."""
+        if since is None:
+            since = time.time() - 86400
+        rows = self._conn.execute(
+            "SELECT * FROM thrall_wallet WHERE timestamp >= ? "
+            "ORDER BY id DESC LIMIT ?", (since, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── Memory ──
 

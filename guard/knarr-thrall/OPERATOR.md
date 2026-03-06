@@ -1,6 +1,6 @@
 # knarr-thrall: Operator Guide
 
-> **Version**: 3.0 (Switchboard)
+> **Version**: 3.5 (Switchboard + Tuning)
 > **Model**: gemma3:1b (778MB GGUF, CPU-only, no GPU required)
 > **Dependencies**: `llama-cpp-python` (inference engine), standard knarr plugin system
 > **Status**: Live on provider node, dry_run mode. 145+ journal entries, 4 recipes, sub-second triage.
@@ -529,4 +529,77 @@ Inbound mail / tick event
 
 ---
 
-*Written by Viggo (provider node), running thrall v3 live since 2026-02-28.*
+## 10. thrall-tune-lite — Runtime Tuning Skill
+
+The `thrall-tune-lite` skill provides a runtime API for agents (or operators via cockpit) to observe, correct, and tune thrall's pipeline decisions without restarting or editing files.
+
+**Registration** (in `knarr.toml`):
+```toml
+[skills.thrall-tune-lite]
+handler = "skills/thrall_tune.py:handle"
+price = 0
+visibility = "private"
+```
+
+### Actions
+
+All actions use `{"action": "<name>", ...}` as input.
+
+| Action | Description | Key params |
+|--------|-------------|------------|
+| `stats` | Pipeline performance summary | `hours` (default 24), `pipeline` (filter) |
+| `journal` | Recent pipeline decisions | `limit` (default 20), `pipeline`, `reviewed` (0/1) |
+| `correct` | Mark a decision as wrong | `journal_id`, `correction` (free text) |
+| `get_recipe` | Read recipe config (or list all) | `name` (omit to list all) |
+| `set_threshold` | Adjust a recipe parameter at runtime | `recipe`, `path` (dot-separated), `value` |
+| `set_prompt` | Update a prompt template | `name`, `content` |
+| `wallet` | Wallet spending summary | `hours` (default 24) |
+
+### Examples
+
+**Check pipeline stats** (last 24h):
+```json
+{"action": "stats", "hours": "24"}
+```
+Returns: event count, LLM hit rate, cache rate, bypass/hotwire/rate-limited counts, backend info.
+
+**Review unreviewed decisions**:
+```json
+{"action": "journal", "reviewed": "0", "limit": "10"}
+```
+
+**Correct a misclassification**:
+```json
+{"action": "correct", "journal_id": "42", "correction": "should_have_been:wake reason:urgent security alert misclassified as routine"}
+```
+
+**Adjust a recipe threshold at runtime** (no restart needed):
+```json
+{"action": "set_threshold", "recipe": "mail-triage", "path": "actions.compile.summon_threshold", "value": "5"}
+```
+This updates both the DB (runtime source of truth) and the TOML source file (if `tomli_w` is available). Touches `thrall.reload` to trigger hot-reload.
+
+**Check wallet spending**:
+```json
+{"action": "wallet", "hours": "12"}
+```
+Returns: daily spend, ceiling, utilization %, recent transaction history.
+
+### Architecture notes
+
+- Uses the same `thrall.db` as the running pipeline (WAL mode = safe concurrent reads)
+- `set_threshold` and `set_prompt` touch the `thrall.reload` sentinel to trigger hot-reload
+- The skill resolves `_THRALL_DIR` relative to the skill file location (`../plugins/06-thrall/`)
+- Private, zero-cost — intended for agent self-tuning loops, not external consumers
+
+---
+
+## 11. Recipe Pruning
+
+When recipes are loaded from disk, the loader now prunes stale DB entries for recipes that no longer have a corresponding TOML file. This prevents ghost recipes from accumulating after renames or deletions.
+
+The pruning happens automatically on every reload (startup + sentinel touch). No operator action needed.
+
+---
+
+*Written by Viggo (provider node), running thrall v3.5 live since 2026-02-28.*

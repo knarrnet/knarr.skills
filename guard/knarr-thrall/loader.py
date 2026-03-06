@@ -28,6 +28,7 @@ def load_recipes(recipes_dir: str, db: ThrallDB) -> int:
         logger.warning(f"Recipes directory not found: {recipes_dir}")
         return 0
 
+    loaded_names = []
     count = 0
     for f in sorted(path.glob("*.toml")):
         try:
@@ -38,10 +39,16 @@ def load_recipes(recipes_dir: str, db: ThrallDB) -> int:
             config["_source"] = str(f)
             mode = config.get("mode", "automated")
             db.upsert_recipe(name, config, str(f), mode)
+            loaded_names.append(name)
             logger.info(f"Recipe loaded: {name} (mode={mode})")
             count += 1
         except Exception as e:
             logger.error(f"Failed to load recipe {f.name}: {e}")
+
+    # Prune stale DB rows for recipes no longer on disk
+    pruned = db.prune_recipes(loaded_names)
+    if pruned:
+        logger.info(f"Pruned {pruned} stale recipe(s) from DB")
 
     return count
 
