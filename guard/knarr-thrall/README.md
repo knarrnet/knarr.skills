@@ -1,7 +1,7 @@
 # knarr-thrall: Autonomous Switchboard Plugin
 
-**Version**: 3.5.0
-**Requires**: knarr >= 0.29.1 (tested up to v0.37.0), PyNaCl, base58 (optional)
+**Version**: 3.7.0
+**Requires**: knarr >= 0.29.1 (tested up to v0.38.1), PyNaCl, base58 (optional)
 
 ## What is thrall?
 
@@ -62,9 +62,22 @@ input = {}
 error_buffer = "health-errors"
 ```
 
-### Context Gather Stage (v3.4.0)
+### Context Gather Stage (v3.4.0 + v3.7.0 catalog)
 
-New pipeline stage between FILTER and EVALUATE. Fetches contextual data before the LLM decides:
+Pipeline stage between FILTER and EVALUATE. Two modes:
+
+**Catalog fields (v3.7.0)** — declare field names, engine deduplicates by source:
+
+```toml
+# 3 fields, 2 API calls (economy + wallet). Source dedup automatic.
+gather = ["settlement_candidates", "net_position", "daily_spend"]
+```
+
+21 fields across 6 sources: `status`, `economy`, `wallet`, `journal`, `peers`, `probe`.
+Glob syntax supported: `gather = ["economy.*"]` expands to all economy fields.
+Catalog defined in `gather-field-catalog.toml`.
+
+**Legacy [[gather]] blocks** — for recipes needing envelope templating (e.g. `{{peer_pk}}`):
 
 ```toml
 [[gather]]
@@ -78,7 +91,7 @@ source = "memory"
 query = { node_id = "{{peer_pk}}", limit = "5" }
 ```
 
-Sources: `cockpit` (HTTP to cockpit API), `memory` (structured decision history), `static` (literal values).
+Both modes coexist. Engine auto-detects: list of strings → catalog, list of dicts → legacy.
 
 ### Structured Memory (v3.4.0)
 
@@ -101,8 +114,8 @@ Classified decision memory replacing unstructured journals. Every record tagged 
 | `task-failures` | on_event | hotwire | Task failure monitoring |
 | `queue-backpressure` | on_tick | hotwire | Queue congestion detection |
 | `selftest` | on_tick | hotwire | 7-point self-test |
-| `swarm-probe` | on_tick | hotwire | Swarm cluster health probe |
-| `settlement-check` | on_tick | hotwire | Autonomous netting proposals (v3.3) |
+| `swarm-probe` | on_tick | hotwire+gather | Swarm probe with economic context (catalog gather v3.7) |
+| `settlement-check` | on_tick | hotwire+gather | Autonomous netting proposals (v3.3, catalog gather v3.7) |
 | `chat` | on_mail | llm | Conversational chat |
 | `concierge-intake` | on_mail | llm | Service intake classification |
 | `concierge-faq` | on_mail | llm | FAQ auto-response |
@@ -237,7 +250,8 @@ INFO thrall.loader: Recipe loaded: settlement-check (mode=automated)
 INFO thrall.engine: Loaded 22 recipes
 INFO thrall.identity: IDENTITY_LOADED public_key=b84d1bc2...
 INFO thrall.wallet: WALLET_INIT ceiling=50.0 daily_spent=0.0 remaining=50.0
-INFO knarr.dht.plugins: Loaded plugin: knarr-thrall v3.5.0
+INFO thrall.gather: CATALOG loaded: 21 fields from .../gather-field-catalog.toml
+INFO knarr.dht.plugins: Loaded plugin: knarr-thrall v3.7.0
 ```
 
 ## Trust Tiers
@@ -260,7 +274,8 @@ known = ["d9196be699447a12"]   # trusted peers — LLM classifies, lower bar
 | `evaluate.py` | LLM orchestrator, L1/L2 cascade, cost tracker, prompt rendering |
 | `backends.py` | LocalBackend, OllamaBackend, OpenAIBackend + factory |
 | `thrall_actions.py` | Action executor (log, compile, wake, act, reply, settle, memory) |
-| `gather.py` | Context gatherer (cockpit, memory, static sources) |
+| `gather.py` | Context gatherer — catalog-based field gather (v3.7) + legacy cockpit/memory/static |
+| `gather-field-catalog.toml` | Field catalog: 21 fields, 6 sources, format specs |
 | `memory.py` | Structured decision memory (tagged records, filtered queries) |
 | `db.py` | ThrallDB (SQLite: journal, buffers, context, cache, memory, wallet) |
 | `loader.py` | Recipe/prompt TOML loader (auto-discovers *.toml) |
