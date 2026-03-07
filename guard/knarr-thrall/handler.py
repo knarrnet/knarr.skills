@@ -140,7 +140,8 @@ class ThrallPlugin(PluginHooks):
         self.memory = ThrallMemory(self.db)
 
         # Initialize context gatherer (pre-prompt data fetching)
-        self.gatherer = ContextGatherer()
+        self.gatherer = ContextGatherer(
+            db=self.db, plugin_dir=self._plugin_dir)
 
         # Initialize engine (with gatherer for [[gather]] recipe stages)
         self.engine = PipelineEngine(
@@ -186,10 +187,12 @@ class ThrallPlugin(PluginHooks):
             query_receipts_fn=getattr(ctx, "query_receipts", None),
         ) if self.identity.enabled else None
 
-        # Wire commerce into action executor and gatherer
+        # Wire commerce, wallet, memory into action executor and gatherer
         if self.commerce:
             self.actions._commerce = self.commerce
             self.gatherer.set_commerce(self.commerce)
+        if self.wallet:
+            self.gatherer.set_wallet(self.wallet)
         self.gatherer.set_memory(self.memory)
 
         # Compilation config

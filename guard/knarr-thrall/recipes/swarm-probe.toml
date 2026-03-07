@@ -4,8 +4,15 @@
 #
 # Hotwire only — no LLM. The skill handles all logic.
 # Cooldown: 2 minutes — fast enough to keep conversation flowing.
+#
+# v3.7: Catalog gather — economic context for self-regulation.
+# probe_entropy + budget_remaining let the probe skill diversify
+# without a hardcoded guardrail.
 
 mode = "automated"
+
+# Catalog gather: peer_count (status) + economy context (wallet/probe)
+gather = ["peer_count", "daily_spend", "budget_remaining", "probe_entropy"]
 
 [trigger]
 type = "on_tick"

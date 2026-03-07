@@ -8,6 +8,8 @@
 #
 # Returns: True (accept) or False (reject).
 # Decision recorded in structured memory for future context.
+#
+# v3.7: Legacy [[gather]] — needs {{peer_pk}} templating.
 
 mode = "automated"
 
@@ -18,7 +20,7 @@ type = "on_inbound_settlement"
 cooldown_key = "inbound-settlement:{{peer_pk}}"
 cooldown_seconds = 60     # 1 min per peer (prevent spam)
 
-# Context gatherers — peer credit history for informed decisions
+# Legacy gather — needs envelope-templated peer_pk for memory query
 [[gather]]
 name = "peer_history"
 source = "memory"
