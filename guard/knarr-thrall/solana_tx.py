@@ -45,7 +45,13 @@ def b58decode(s: str) -> bytes:
     for c in s:
         n = n * 58 + _B58_MAP[c]
     raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
-    pad = sum(1 for c in s if c == "1")
+    # Count only LEADING "1"s (each represents a 0x00 byte)
+    pad = 0
+    for c in s:
+        if c == "1":
+            pad += 1
+        else:
+            break
     return b"\x00" * pad + raw
 
 
@@ -71,6 +77,7 @@ def b58encode(data: bytes) -> str:
 
 SYSTEM_PROGRAM = bytes(32)
 TOKEN_PROGRAM = b58decode("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+TOKEN_2022_PROGRAM = b58decode("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 ATA_PROGRAM = b58decode("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 
 
@@ -90,6 +97,47 @@ def compact_u16(n: int) -> bytes:
     return bytes(buf)
 
 
+# ── Ed25519 on-curve check ─────────────────────────────────────────────
+
+# Constants for Ed25519 twisted Edwards curve: -x² + y² = 1 + d·x²·y²
+_ED25519_P = 2**255 - 19
+_ED25519_D = -121665 * pow(121666, -1, _ED25519_P) % _ED25519_P
+_ED25519_SQRT_NEG1 = pow(2, (_ED25519_P - 1) // 4, _ED25519_P)
+
+
+def _is_on_ed25519_curve(point_bytes: bytes) -> bool:
+    """Check if 32 bytes decompress to a valid non-identity Ed25519 point.
+
+    Matches Solana's on-curve check exactly (compressed Edwards Y
+    decompression + identity exclusion). Does NOT check subgroup
+    membership — this is intentional, as Solana's findProgramAddress
+    only checks decompressibility, not subgroup.
+
+    NaCl's crypto_sign_ed25519_pk_to_curve25519 is too strict: it also
+    rejects small-order and non-main-subgroup points, which causes
+    incorrect bump selection for PDA derivation.
+    """
+    if len(point_bytes) != 32:
+        return False
+    y = int.from_bytes(point_bytes, "little") & ((1 << 255) - 1)
+    if y >= _ED25519_P:
+        return False
+    y2 = y * y % _ED25519_P
+    num = (y2 - 1) % _ED25519_P
+    den = (1 + _ED25519_D * y2) % _ED25519_P
+    if den == 0:
+        return False
+    x2 = num * pow(den, -1, _ED25519_P) % _ED25519_P
+    if x2 == 0:
+        return y != 1  # (0, 1) is the identity point
+    beta = pow(x2, (_ED25519_P + 3) // 8, _ED25519_P)
+    if (beta * beta - x2) % _ED25519_P == 0:
+        return True
+    if (beta * beta + x2) % _ED25519_P == 0:
+        return True
+    return False  # not a quadratic residue → not on curve
+
+
 # ── PDA and ATA derivation ──────────────────────────────────────────────
 
 def find_program_address(seeds: List[bytes], program_id: bytes) -> Tuple[bytes, int]:
@@ -98,8 +146,6 @@ def find_program_address(seeds: List[bytes], program_id: bytes) -> Tuple[bytes, 
     Equivalent to Solana's findProgramAddress: tries bumps from 255 down,
     returns the first candidate that is NOT on the Ed25519 curve.
     """
-    from nacl.bindings import crypto_sign_ed25519_pk_to_curve25519
-
     for bump in range(255, -1, -1):
         h = hashlib.sha256()
         for seed in seeds:
@@ -108,20 +154,22 @@ def find_program_address(seeds: List[bytes], program_id: bytes) -> Tuple[bytes, 
         h.update(program_id)
         h.update(b"ProgramDerivedAddress")
         candidate = h.digest()
-        try:
-            # If this succeeds, candidate IS on the Ed25519 curve → NOT a valid PDA
-            crypto_sign_ed25519_pk_to_curve25519(candidate)
-            continue
-        except Exception:
-            # Not on curve → valid PDA
+        if not _is_on_ed25519_curve(candidate):
             return candidate, bump
     raise ValueError("Could not derive PDA (exhausted all bumps)")
 
 
-def get_associated_token_address(owner: bytes, mint: bytes) -> bytes:
-    """Derive the Associated Token Account address for an owner + mint."""
+def get_associated_token_address(owner: bytes, mint: bytes,
+                                  token_program: bytes = None) -> bytes:
+    """Derive the Associated Token Account address for an owner + mint.
+
+    Uses TOKEN_2022_PROGRAM by default ($KNARR is a Token-2022 mint).
+    Pass token_program=TOKEN_PROGRAM for legacy SPL tokens.
+    """
+    if token_program is None:
+        token_program = TOKEN_2022_PROGRAM
     pda, _ = find_program_address(
-        [owner, TOKEN_PROGRAM, mint],
+        [owner, token_program, mint],
         ATA_PROGRAM,
     )
     return pda
@@ -228,6 +276,7 @@ def build_spl_transfer_tx(
     mint: bytes,             # 32-byte SPL token mint address
     amount: int,             # Amount in base units (1 token = 10^decimals)
     recent_blockhash: bytes, # 32-byte recent blockhash
+    token_program: bytes = None,  # Token program (default: Token-2022)
 ) -> bytes:
     """Build a signed SPL token transfer transaction.
 
@@ -237,12 +286,16 @@ def build_spl_transfer_tx(
     2. SPL Token Transfer from sender's ATA to recipient's ATA
 
     Sender's ATA must already exist and have sufficient balance.
+    Uses Token-2022 program by default ($KNARR is a Token-2022 mint).
 
     Returns the fully serialized, signed transaction ready for RPC submission.
     """
+    if token_program is None:
+        token_program = TOKEN_2022_PROGRAM
+
     sender = signing_key.verify_key.encode()  # 32-byte pubkey
-    source_ata = get_associated_token_address(sender, mint)
-    dest_ata = get_associated_token_address(recipient, mint)
+    source_ata = get_associated_token_address(sender, mint, token_program)
+    dest_ata = get_associated_token_address(recipient, mint, token_program)
 
     # Account keys — ordered per Solana convention:
     #   [writable signers] [readonly signers] [writable non-signers] [readonly non-signers]
@@ -253,7 +306,7 @@ def build_spl_transfer_tx(
         recipient,       # 3: recipient wallet (read-only, ATA owner)
         mint,            # 4: token mint (read-only)
         SYSTEM_PROGRAM,  # 5: system program (read-only)
-        TOKEN_PROGRAM,   # 6: SPL token program (read-only)
+        token_program,   # 6: token program — Token-2022 (read-only)
         ATA_PROGRAM,     # 7: ATA program (read-only)
     ]
 
