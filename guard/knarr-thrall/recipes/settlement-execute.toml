@@ -1,13 +1,13 @@
-# settlement-execute — Execute on-chain settlement transfer (Solana devnet).
+# settlement-execute — Execute on-chain $KNARR settlement (Solana testnet).
 #
-# Fires when a settlement is accepted by the peer. Derives the peer's
-# Solana address, checks wallet ceiling, submits a devnet transfer.
+# Fires when a settlement is accepted by the peer. Builds an SPL token
+# transfer for the $KNARR mint, signs with thrall identity, submits to RPC.
 #
 # This completes the autonomous settlement flow:
 #   settlement-check (hourly) → propose netting → peer accepts →
 #   settlement-execute (this) → BCW detects → payment-finalized confirms
 #
-# Safety: devnet only, wallet ceiling gated, 1h cooldown per peer.
+# Safety: testnet only, wallet ceiling gated, 1h cooldown per peer.
 
 mode = "automated"
 
@@ -36,5 +36,5 @@ default_action = "execute_settlement"
 
 [actions.execute_settlement]
 skill = "settlement-execute-lite"
-input = { peer_node_id = "{{peer_node_id}}", settle_amount = "{{settle_amount}}", chain = "solana_devnet" }
+input = { peer_node_id = "{{peer_node_id}}", settle_amount = "{{settle_amount}}", chain = "solana_testnet" }
 error_buffer = "settlement-errors"

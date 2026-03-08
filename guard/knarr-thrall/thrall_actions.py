@@ -15,14 +15,19 @@ Wake has two modes:
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from db import ThrallDB
 from engine import ActionResult
 
 logger = logging.getLogger("thrall.actions")
+
+# Default priority keywords for briefing flagging.
+# Override via plugin.toml [config.thrall] priority_keywords or recipe summon_keywords.
+PRIORITY_KEYWORDS_DEFAULT = ["URGENT", "CRITICAL", "OUTAGE", "INCIDENT"]
 
 # Artifacts dir for process-mode briefings
 _ARTIFACTS_DIR = None
@@ -42,13 +47,19 @@ class ActionExecutor:
 
     def __init__(self, db: ThrallDB, send_mail_fn: Callable = None,
                  call_skill_fn: Callable = None, summon_fn: Callable = None,
-                 plugin_dir: str = "", commerce=None):
+                 plugin_dir: str = "", commerce=None,
+                 priority_keywords: List[str] = None,
+                 memory_writer=None):
         self.db = db
         self._send_mail = send_mail_fn
         self._call_skill = call_skill_fn
         self._summon = summon_fn
         self._plugin_dir = plugin_dir
         self._commerce = commerce
+        self._priority_keywords = priority_keywords or PRIORITY_KEYWORDS_DEFAULT
+        self._memory_writer = memory_writer
+        # Consecutive skill failure tracking for memory hooks
+        self._skill_fail_streak: Dict[str, int] = {}  # skill_name -> consecutive failures
         # Compilation flush state
         self._buffer_timers: Dict[str, float] = {}  # buffer_name -> last_flush_time
 
@@ -125,10 +136,10 @@ class ActionExecutor:
         logger.debug(f"COMPILE buffer={buffer_name} count={count} "
                      f"threshold={threshold} keywords={keywords}")
 
-        # Check keyword trigger — immediate summon
+        # Check keyword trigger — immediate summon (word-boundary match)
         if keywords:
             for kw in keywords:
-                if kw.lower() in body_text.lower():
+                if re.search(r'\b' + re.escape(kw) + r'\b', body_text, re.IGNORECASE):
                     logger.info(f"THRALL keyword trigger: '{kw}' in mail -> summon")
                     await self._flush_and_summon(
                         buffer_name, f"keyword:{kw}")
@@ -222,10 +233,10 @@ class ActionExecutor:
         for e in entries:
             entry = e["entry"]
             senders.add(entry.get("from_node", "?")[:16])
-            # Flag priority items (keyword triggers, urgent classifications)
-            reason = entry.get("eval_reason", "").lower()
+            # Flag priority items (word-boundary match, configurable keywords)
             body = entry.get("body", entry.get("body_preview", ""))
-            if any(kw in body.upper() for kw in ["BUG", "DOWN", "URGENT", "CRITICAL", "SECURITY"]):
+            if any(re.search(r'\b' + re.escape(kw) + r'\b', body, re.IGNORECASE)
+                   for kw in self._priority_keywords):
                 priority_items.append({
                     "from": entry.get("from_node", "?")[:16],
                     "preview": _truncate(body, 120),
@@ -351,6 +362,16 @@ class ActionExecutor:
 
             if is_error:
                 logger.warning(f"SKILL_ERROR {skill}: {error_msg}")
+                # Track consecutive failures for memory hook
+                self._skill_fail_streak[skill] = self._skill_fail_streak.get(skill, 0) + 1
+                if self._memory_writer and self._skill_fail_streak[skill] >= 3:
+                    peer = envelope.get("from_node", "?")[:16]
+                    self._memory_writer.append(
+                        "operations",
+                        f"Skill `{skill}` from peer {peer}: unreliable, "
+                        f"{self._skill_fail_streak[skill]} consecutive failures. "
+                        f"Last error: {_truncate(error_msg, 100)}")
+                    self._skill_fail_streak[skill] = 0  # reset after recording
                 # Compile errors into error buffer for awareness
                 error_buffer = actions_cfg.get("error_buffer")
                 if error_buffer:
@@ -364,6 +385,8 @@ class ActionExecutor:
                 return ActionResult("act_error",
                                     f"skill={skill} error={_truncate(error_msg, 200)}")
 
+            # Success — reset failure streak
+            self._skill_fail_streak.pop(skill, None)
             return ActionResult("act", f"skill={skill} result={_truncate(str(result), 200)}")
         except Exception as e:
             logger.error(f"Skill call failed: {skill}: {e}")

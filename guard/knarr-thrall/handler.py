@@ -33,7 +33,7 @@ from loader import load_all
 from identity import ThrallIdentity
 from wallet import ThrallWallet
 from commerce import ThrallCommerce
-from memory import ThrallMemory
+from memory import ThrallMemory, MemoryWriter
 from gather import ContextGatherer
 
 logger = logging.getLogger("thrall")
@@ -128,16 +128,23 @@ class ThrallPlugin(PluginHooks):
         )
 
         # Initialize action executor (commerce wired after identity init below)
+        priority_kw = thrall_cfg.get("priority_keywords", None)
         self.actions = ActionExecutor(
             db=self.db,
             send_mail_fn=self._send_mail,
             call_skill_fn=self._call_skill,
             summon_fn=self._summon_agent,
             plugin_dir=self._plugin_dir,
+            priority_keywords=priority_kw,
+            memory_writer=self._memory_writer,
         )
 
         # Initialize structured memory
         self.memory = ThrallMemory(self.db)
+
+        # Initialize living memory pillar writer
+        rag_dir = os.path.join(self._plugin_dir, "rag")
+        self._memory_writer = MemoryWriter(rag_dir)
 
         # Initialize context gatherer (pre-prompt data fetching)
         self.gatherer = ContextGatherer(
@@ -410,6 +417,12 @@ class ThrallPlugin(PluginHooks):
                     self.memory.record(
                         skill="settlement-review", node_id=peer_pk,
                         outcome="approved", amount=amount, reasoning=reason)
+                    # Living memory hook: record settlement in peers pillar
+                    if hasattr(self, '_memory_writer') and self._memory_writer:
+                        self._memory_writer.append(
+                            "peers",
+                            f"Peer {peer_pk[:16]}: settled {amount:.1f}cr at "
+                            f"{utilization:.0f}% util — approved ({reason[:60]})")
                     self._log.info(f"SETTLEMENT_REVIEW approved: peer={peer_pk[:16]} "
                                    f"amount={amount:.1f} reason={reason}")
                     return signed
@@ -417,6 +430,12 @@ class ThrallPlugin(PluginHooks):
                     self.memory.record(
                         skill="settlement-review", node_id=peer_pk,
                         outcome="rejected", amount=amount, reasoning=reason)
+                    # Living memory hook: record rejection in peers pillar
+                    if hasattr(self, '_memory_writer') and self._memory_writer:
+                        self._memory_writer.append(
+                            "peers",
+                            f"Peer {peer_pk[:16]}: settlement rejected "
+                            f"({amount:.1f}cr) — {reason[:80]}")
                     self._log.info(f"SETTLEMENT_REVIEW rejected: peer={peer_pk[:16]} "
                                    f"amount={amount:.1f} reason={reason}")
                     return None

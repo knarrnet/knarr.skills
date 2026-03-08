@@ -161,6 +161,16 @@ def _fetch_source_journal(db, hours: int = 24) -> dict:
     return {"recent_actions": recent, "action_counts": counts}
 
 
+def _fetch_source_memory(db, hours: int = 72) -> dict:
+    """Query thrall_memory table for settlement and skill call history."""
+    if not db:
+        return {"error": "no db"}
+    cutoff = time.time() - (hours * 3600)
+
+    settlements = db.query_memory(skill="settlement-review", limit=10, since=cutoff)
+    return {"recent_settlements": settlements}
+
+
 def _fetch_source_probe(db, hours: int = 24) -> dict:
     """Computed probe fields — no API call."""
     if not db:
@@ -270,6 +280,10 @@ def _extract_field(field_name: str, field_meta: dict,
     if source == "peers":
         return _extract_peers_field(field_name, field_meta, source_data)
 
+    # Memory fields
+    if source == "memory":
+        return _extract_memory_field(field_name, field_meta, source_data)
+
     return "unavailable"
 
 
@@ -369,6 +383,29 @@ def _extract_peers_field(field_name: str, field_meta: dict,
     elif field_name == "peer_skill_gaps":
         # Would require comparing our skills vs network skills — simplified
         return "unavailable (requires skill comparison)"
+
+    return "unavailable"
+
+
+def _extract_memory_field(field_name: str, field_meta: dict,
+                           data: dict) -> str:
+    """Extract memory fields from thrall_memory query results."""
+    if isinstance(data, dict) and "error" in data:
+        return f"error: {data['error']}"
+
+    if field_name == "recent_settlements":
+        entries = data.get("recent_settlements", [])
+        if not entries:
+            return "no recent settlements"
+        lines = []
+        for e in entries:
+            ts = time.strftime("%m-%d %H:%M", time.gmtime(e.get("timestamp", 0)))
+            peer = e.get("node_id", "?")[:16]
+            outcome = e.get("outcome", "?")
+            amount = e.get("amount", 0)
+            reason = e.get("reasoning", "")[:60]
+            lines.append(f"  {ts} {peer}: {outcome} {amount:.1f}cr — {reason}")
+        return "\n".join(lines)
 
     return "unavailable"
 
@@ -482,6 +519,8 @@ class ContextGatherer:
                     source_data[source] = _fetch_source_journal(self._db)
                 elif source == "peers":
                     source_data[source] = _fetch_source_peers(self._commerce)
+                elif source == "memory":
+                    source_data[source] = _fetch_source_memory(self._db)
                 elif source == "none":
                     source_data[source] = _fetch_source_probe(self._db)
                 else:

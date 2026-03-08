@@ -129,6 +129,14 @@ type = "table"
 cost = "peers"
 format = "rows: skill_name, provider_count, avg_price"
 
+# ── Source: memory (thrall_memory table) ───────────────────────────────
+
+[fields.recent_settlements]
+description = "Last 10 settlement reviews with peer, outcome, amount, and reasoning."
+type = "table"
+cost = "memory"
+format = "rows: timestamp, peer_id, outcome, amount, reasoning"
+
 # ── Source: probe (computed, no API call) ──────────────────────────────
 
 [fields.probe_entropy]
