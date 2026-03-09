@@ -1,11 +1,9 @@
 """Thrall Switchboard — Database layer.
 
-Tables:
+Three tables:
 - thrall_journal: every pipeline execution (audit + training + dryrun)
 - thrall_context: async workflow state (session continuations, flags)
 - thrall_recipes: runtime cache of loaded recipe configs
-- thrall_wallet: delegated spending ledger (settlement identity)
-- thrall_memory: classified decision memory (skill, node_id, outcome)
 """
 
 import json
@@ -75,27 +73,30 @@ class ThrallDB:
             );
             CREATE INDEX IF NOT EXISTS idx_comp_buffer ON thrall_compilation(buffer_name);
 
-            CREATE TABLE IF NOT EXISTS thrall_wallet (
+            CREATE TABLE IF NOT EXISTS thrall_wallet_spend (
                 id          INTEGER PRIMARY KEY,
                 timestamp   REAL NOT NULL,
                 amount      REAL NOT NULL,
-                reference   TEXT,
-                peer_pk     TEXT,
-                description TEXT
+                reference   TEXT DEFAULT '',
+                peer_pk     TEXT DEFAULT '',
+                description TEXT DEFAULT ''
             );
-            CREATE INDEX IF NOT EXISTS idx_wallet_ts ON thrall_wallet(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_wallet_ts ON thrall_wallet_spend(timestamp);
+        """)
 
+        # Structured memory for decision tracking (v3.8)
+        c.executescript("""
             CREATE TABLE IF NOT EXISTS thrall_memory (
-                id            INTEGER PRIMARY KEY,
-                timestamp     REAL NOT NULL,
-                skill         TEXT NOT NULL,
-                node_id       TEXT NOT NULL DEFAULT '',
-                mail_id       TEXT NOT NULL DEFAULT '',
-                outcome       TEXT NOT NULL,
-                amount        REAL DEFAULT 0.0,
-                reasoning     TEXT DEFAULT '',
-                metadata_json TEXT,
-                dryrun        INTEGER DEFAULT 0
+                id          INTEGER PRIMARY KEY,
+                timestamp   REAL NOT NULL,
+                skill       TEXT NOT NULL DEFAULT '',
+                node_id     TEXT NOT NULL DEFAULT '',
+                outcome     TEXT NOT NULL DEFAULT '',
+                mail_id     TEXT DEFAULT '',
+                amount      REAL DEFAULT 0.0,
+                reasoning   TEXT DEFAULT '',
+                metadata_json TEXT DEFAULT '',
+                dryrun      INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_memory_skill ON thrall_memory(skill);
             CREATE INDEX IF NOT EXISTS idx_memory_node ON thrall_memory(node_id);
@@ -248,15 +249,6 @@ class ThrallDB:
         d["config"] = json.loads(d["config_json"])
         return d
 
-    def get_all_recipes(self) -> List[dict]:
-        rows = self._conn.execute("SELECT * FROM thrall_recipes").fetchall()
-        result = []
-        for r in rows:
-            d = dict(r)
-            d["config"] = json.loads(d["config_json"])
-            result.append(d)
-        return result
-
     def prune_recipes(self, keep_names: List[str]) -> int:
         """Delete DB rows for recipes not in keep_names. Returns count pruned."""
         if not keep_names:
@@ -267,6 +259,15 @@ class ThrallDB:
             keep_names)
         self._conn.commit()
         return cur.rowcount
+
+    def get_all_recipes(self) -> List[dict]:
+        rows = self._conn.execute("SELECT * FROM thrall_recipes").fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["config"] = json.loads(d["config_json"])
+            result.append(d)
+        return result
 
     # ── Compilation buffer ──
 
@@ -304,72 +305,69 @@ class ThrallDB:
 
     # ── Wallet ──
 
+    def get_daily_spend(self, day_start: float) -> float:
+        """Sum all wallet spending since day_start (midnight UTC)."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) as total FROM thrall_wallet_spend "
+            "WHERE timestamp >= ?", (day_start,)
+        ).fetchone()
+        return row["total"] if row else 0.0
+
     def record_wallet_spend(self, amount: float, reference: str = "",
                             peer_pk: str = "", description: str = ""):
+        """Record a spending event."""
         self._conn.execute("""
-            INSERT INTO thrall_wallet (timestamp, amount, reference, peer_pk, description)
+            INSERT INTO thrall_wallet_spend (timestamp, amount, reference, peer_pk, description)
             VALUES (?, ?, ?, ?, ?)
         """, (time.time(), amount, reference, peer_pk, description))
         self._conn.commit()
-
-    def get_daily_spend(self, day_start: float = None) -> float:
-        """Sum of wallet spending since day_start (default: midnight UTC today)."""
-        if day_start is None:
-            import calendar
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc)
-            day_start = calendar.timegm(now.replace(
-                hour=0, minute=0, second=0, microsecond=0).timetuple())
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(amount), 0.0) as total FROM thrall_wallet "
-            "WHERE timestamp >= ?", (day_start,)
-        ).fetchone()
-        return row["total"]
 
     def get_wallet_history(self, since: float = None, limit: int = 50) -> List[dict]:
         """Return wallet spending records since timestamp (default: last 24h)."""
         if since is None:
             since = time.time() - 86400
         rows = self._conn.execute(
-            "SELECT * FROM thrall_wallet WHERE timestamp >= ? "
+            "SELECT * FROM thrall_wallet_spend WHERE timestamp >= ? "
             "ORDER BY id DESC LIMIT ?", (since, limit)
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # ── Memory ──
+    # ── Structured Memory ──
 
     def record_memory(self, skill: str, node_id: str, outcome: str,
                       mail_id: str = "", amount: float = 0.0,
                       reasoning: str = "", metadata: dict = None,
                       dryrun: bool = False) -> int:
+        """Record a decision outcome in structured memory."""
+        meta_json = json.dumps(metadata) if metadata else ""
         cur = self._conn.execute("""
             INSERT INTO thrall_memory
-                (timestamp, skill, node_id, mail_id, outcome,
-                 amount, reasoning, metadata_json, dryrun)
+                (timestamp, skill, node_id, outcome, mail_id, amount,
+                 reasoning, metadata_json, dryrun)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            time.time(), skill, node_id[:64], mail_id, outcome,
-            amount, reasoning,
-            json.dumps(metadata) if metadata else None,
+            time.time(), skill, node_id[:16], outcome,
+            mail_id, amount, reasoning[:500], meta_json,
             1 if dryrun else 0,
         ))
         self._conn.commit()
         return cur.lastrowid
 
-    def query_memory(self, node_id: str = None, skill: str = None,
+    def query_memory(self, skill: str = None, node_id: str = None,
                      outcome: str = None, limit: int = 10,
                      since: float = None,
                      include_dryrun: bool = False) -> List[dict]:
+        """Query structured memory with flexible filters."""
         sql = "SELECT * FROM thrall_memory WHERE 1=1"
         params: list = []
         if not include_dryrun:
             sql += " AND dryrun = 0"
-        if node_id:
-            sql += " AND node_id = ?"
-            params.append(node_id[:64])
         if skill:
             sql += " AND skill = ?"
             params.append(skill)
+        if node_id:
+            sql += " AND node_id = ?"
+            params.append(node_id[:16])
         if outcome:
             sql += " AND outcome = ?"
             params.append(outcome)
@@ -383,7 +381,12 @@ class ThrallDB:
         for r in rows:
             d = dict(r)
             if d.get("metadata_json"):
-                d["metadata"] = json.loads(d["metadata_json"])
+                try:
+                    d["metadata"] = json.loads(d["metadata_json"])
+                except (json.JSONDecodeError, ValueError):
+                    d["metadata"] = {}
+            else:
+                d["metadata"] = {}
             result.append(d)
         return result
 

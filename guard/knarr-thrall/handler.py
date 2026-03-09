@@ -127,6 +127,18 @@ class ThrallPlugin(PluginHooks):
             l1_prompt=cascade_cfg.get("l1_prompt", "triage-l1"),
         )
 
+        # Initialize living memory pillar writer (before ActionExecutor which needs it)
+        rag_dir = thrall_cfg.get("rag_dir", "")
+        if not rag_dir:
+            candidate = os.path.join(self._plugin_dir, "rag")
+            if os.path.isdir(candidate):
+                rag_dir = candidate
+            elif os.path.isdir("/app/rag"):
+                rag_dir = "/app/rag"
+            else:
+                rag_dir = candidate  # fallback, MemoryWriter creates it
+        self._memory_writer = MemoryWriter(rag_dir)
+
         # Initialize action executor (commerce wired after identity init below)
         priority_kw = thrall_cfg.get("priority_keywords", None)
         self.actions = ActionExecutor(
@@ -139,12 +151,9 @@ class ThrallPlugin(PluginHooks):
             memory_writer=self._memory_writer,
         )
 
-        # Initialize structured memory
+        # Initialize structured memory and wire to action executor
         self.memory = ThrallMemory(self.db)
-
-        # Initialize living memory pillar writer
-        rag_dir = os.path.join(self._plugin_dir, "rag")
-        self._memory_writer = MemoryWriter(rag_dir)
+        self.actions._structured_memory = self.memory
 
         # Initialize context gatherer (pre-prompt data fetching)
         self.gatherer = ContextGatherer(

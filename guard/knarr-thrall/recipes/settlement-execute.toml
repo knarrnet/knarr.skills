@@ -13,7 +13,7 @@ mode = "automated"
 
 [trigger]
 type = "on_event"
-event_pattern = "settlement.accepted"
+event_pattern = "settlement.confirmed"
 
 [filter]
 cooldown_key = "settle-exec-{{peer_public_key}}"

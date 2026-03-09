@@ -49,7 +49,8 @@ class ActionExecutor:
                  call_skill_fn: Callable = None, summon_fn: Callable = None,
                  plugin_dir: str = "", commerce=None,
                  priority_keywords: List[str] = None,
-                 memory_writer=None):
+                 memory_writer=None,
+                 structured_memory=None):
         self.db = db
         self._send_mail = send_mail_fn
         self._call_skill = call_skill_fn
@@ -58,6 +59,7 @@ class ActionExecutor:
         self._commerce = commerce
         self._priority_keywords = priority_keywords or PRIORITY_KEYWORDS_DEFAULT
         self._memory_writer = memory_writer
+        self._structured_memory = structured_memory
         # Consecutive skill failure tracking for memory hooks
         self._skill_fail_streak: Dict[str, int] = {}  # skill_name -> consecutive failures
         # Compilation flush state
@@ -382,11 +384,50 @@ class ActionExecutor:
                         "timestamp": time.time(),
                     }
                     self.db.add_to_buffer(error_buffer, entry, f"act:{skill}")
+                if self._structured_memory and skill not in ("swarm-probe-lite", "knarr-static"):
+                    err_peer = (skill_input.get("peer_node_id", "")
+                                or envelope.get("from_node", "")
+                                or envelope.get("peer_node_id", ""))
+                    self._structured_memory.record(
+                        skill=skill, node_id=err_peer or "self",
+                        outcome="error",
+                        reasoning=_truncate(error_msg, 200))
                 return ActionResult("act_error",
                                     f"skill={skill} error={_truncate(error_msg, 200)}")
 
-            # Success — reset failure streak
+            # Success — reset failure streak and record in memory
             self._skill_fail_streak.pop(skill, None)
+            # Resolve peer: skill_input > envelope > result
+            peer = (skill_input.get("peer_node_id", "")
+                    or envelope.get("from_node", "")
+                    or envelope.get("peer_node_id", "")
+                    or (result.get("node_id", "") if isinstance(result, dict) else ""))
+            peer_display = peer[:16] if peer else "self"
+            if self._memory_writer and skill not in ("swarm-probe-lite", "knarr-mail", "knarr-static"):
+                self._memory_writer.append(
+                    "peers",
+                    f"Peer {peer_display}: `{skill}` succeeded. "
+                    f"Result: {_truncate(str(result), 80)}")
+            if self._structured_memory and skill not in ("swarm-probe-lite", "knarr-static"):
+                # Build useful reasoning: eval reason + result summary
+                reason_parts = []
+                if eval_result and getattr(eval_result, "reason", ""):
+                    reason_parts.append(eval_result.reason)
+                if isinstance(result, dict):
+                    summary = result.get("result_summary", "") or result.get("status", "")
+                    if summary:
+                        reason_parts.append(str(summary))
+                reason = " | ".join(reason_parts) if reason_parts else _truncate(str(result), 200)
+                # Extract amount from skill_input if available
+                amount = 0.0
+                try:
+                    amount = float(skill_input.get("settle_amount", 0))
+                except (ValueError, TypeError):
+                    pass
+                self._structured_memory.record(
+                    skill=skill, node_id=peer or "self",
+                    outcome="success", amount=amount,
+                    reasoning=_truncate(reason, 500))
             return ActionResult("act", f"skill={skill} result={_truncate(str(result), 200)}")
         except Exception as e:
             logger.error(f"Skill call failed: {skill}: {e}")
@@ -504,6 +545,16 @@ class ActionExecutor:
             result = await self._call_skill(skill, skill_input)
             status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
             logger.info(f"EXECUTE_SETTLEMENT {skill}: status={status}")
+            # Living memory hook: record settlement execution
+            if self._memory_writer:
+                peer = skill_input.get("peer_node_id", "?")[:16]
+                amount = skill_input.get("settle_amount", "?")
+                tx_hash = result.get("tx_hash", "") if isinstance(result, dict) else ""
+                domain = "strategy" if status == "ok" else "operations"
+                entry = f"On-chain settlement to peer {peer}: {amount}cr, status={status}"
+                if tx_hash:
+                    entry += f", tx={tx_hash[:16]}"
+                self._memory_writer.append(domain, entry)
             return ActionResult("execute_settlement",
                                 f"skill={skill} status={status} "
                                 f"result={_truncate(str(result), 200)}")

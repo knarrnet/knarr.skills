@@ -222,7 +222,7 @@ class OpenAIBackend(ThrallBackend):
         return await asyncio.to_thread(_call)
 
     def _call_openai(self, system_prompt: str, user_prompt: str) -> str:
-        payload = json.dumps({
+        body = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -231,7 +231,10 @@ class OpenAIBackend(ThrallBackend):
             "temperature": self._temperature,
             "max_tokens": self._max_tokens,
             "response_format": {"type": "json_object"},
-        }).encode()
+            # Disable thinking for models that support it (Qwen3.5 via vLLM)
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        payload = json.dumps(body).encode()
 
         req = Request(
             f"{self._url}/chat/completions",
