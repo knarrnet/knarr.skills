@@ -24,6 +24,7 @@ Sources (legacy):
     static   — Literal values
 """
 
+import asyncio
 import fnmatch
 import logging
 import math
@@ -558,6 +559,9 @@ class ContextGatherer:
 
         Results are keyed by the gather name. Each value is the fetched
         data (dict, list, or string depending on source).
+
+        HTTP-based sources (cockpit, commerce) run in threads to avoid
+        blocking the event loop during sync urllib calls.
         """
         gather_configs = recipe.get("gather", [])
         if not gather_configs:
@@ -566,6 +570,9 @@ class ContextGatherer:
         results = {}
         t0 = time.time()
 
+        # Sources that do sync HTTP and must be offloaded to a thread
+        _IO_SOURCES = {"cockpit", "commerce", "http"}
+
         for cfg in gather_configs:
             name = cfg.get("name", "")
             source = cfg.get("source", "")
@@ -573,7 +580,10 @@ class ContextGatherer:
                 continue
 
             try:
-                value = self._fetch_one(cfg, envelope)
+                if source in _IO_SOURCES:
+                    value = await asyncio.to_thread(self._fetch_one, cfg, envelope)
+                else:
+                    value = self._fetch_one(cfg, envelope)
                 results[name] = value
                 preview = str(value)[:100] if value else "empty"
                 logger.debug(f"GATHER {name} ({source}): {preview}")
