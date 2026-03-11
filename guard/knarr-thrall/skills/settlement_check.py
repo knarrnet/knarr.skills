@@ -84,6 +84,7 @@ async def handle(input_data: dict) -> dict:
     from wallet import ThrallWallet
     from commerce import ThrallCommerce
     from db import ThrallDB
+    from memory import CircuitBreaker
 
     # Initialize components
     db = ThrallDB(os.path.join(plugin_dir, "thrall.db"))
@@ -106,11 +107,13 @@ async def handle(input_data: dict) -> dict:
         node_id=node_id,
         default_policy=policy,
     )
+    breaker_cfg = thrall_cfg.get("circuit_breaker", {})
+    breaker = CircuitBreaker(db, breaker_cfg)
 
     # Check positions
-    ledger = commerce.query_ledger()
+    ledger = await commerce.query_ledger()
     positions_checked = len(ledger)
-    positions = commerce.check_positions(threshold)
+    positions = await commerce.check_positions(threshold)
 
     if not positions:
         return {
@@ -126,9 +129,16 @@ async def handle(input_data: dict) -> dict:
     proposed = 0
     total_amount = 0.0
     skipped_ceiling = 0
+    skipped_circuit = 0
 
     for pos in positions:
         amount = pos["settle_amount"]
+        peer_pk = pos["peer_public_key"]
+
+        # Check circuit breaker — skip peers with open circuits
+        if breaker.is_open(peer_pk, "settlement"):
+            skipped_circuit += 1
+            continue
 
         # Check wallet ceiling
         if not wallet.can_spend(amount):
@@ -154,18 +164,19 @@ async def handle(input_data: dict) -> dict:
             }
             try:
                 await NODE.send_mail(
-                    pos["peer_public_key"], "knarr/commerce/settle_request", body)
-                wallet.record_spend(amount, f"netting:{pos['peer_public_key'][:16]}",
-                                    pos["peer_public_key"],
+                    peer_pk, "knarr/commerce/settle_request", body)
+                wallet.record_spend(amount, f"netting:{peer_pk[:16]}",
+                                    peer_pk,
                                     f"Auto-settlement at {pos['utilization_pct']}% utilization")
+                breaker.record_success(peer_pk, "settlement")
                 proposed += 1
                 total_amount += amount
             except Exception as e:
-                pass  # logged by commerce module
+                breaker.record_failure(peer_pk, "settlement")
         else:
             # No NODE — record the proposal anyway for observability
-            wallet.record_spend(amount, f"netting:{pos['peer_public_key'][:16]}",
-                                pos["peer_public_key"],
+            wallet.record_spend(amount, f"netting:{peer_pk[:16]}",
+                                peer_pk,
                                 f"Proposal built (no send_mail), {pos['utilization_pct']}% util")
             proposed += 1
             total_amount += amount
@@ -175,6 +186,8 @@ async def handle(input_data: dict) -> dict:
         status = "ceiling_hit"
 
     summary_parts = [f"checked={positions_checked}", f"proposed={proposed}"]
+    if skipped_circuit:
+        summary_parts.append(f"circuit_open={skipped_circuit}")
     if skipped_ceiling:
         summary_parts.append(f"ceiling_blocked={skipped_ceiling}")
 
@@ -184,6 +197,7 @@ async def handle(input_data: dict) -> dict:
         "settlements_proposed": str(proposed),
         "total_amount": f"{total_amount:.1f}",
         "skipped_ceiling": str(skipped_ceiling),
+        "skipped_circuit": str(skipped_circuit),
         "result_summary": ", ".join(summary_parts),
         "wall_ms": str(int((time.time() - t0) * 1000)),
     }

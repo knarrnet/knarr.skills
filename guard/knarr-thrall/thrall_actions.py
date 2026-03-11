@@ -50,7 +50,8 @@ class ActionExecutor:
                  plugin_dir: str = "", commerce=None,
                  priority_keywords: List[str] = None,
                  memory_writer=None,
-                 structured_memory=None):
+                 structured_memory=None,
+                 circuit_breaker=None):
         self.db = db
         self._send_mail = send_mail_fn
         self._call_skill = call_skill_fn
@@ -60,6 +61,7 @@ class ActionExecutor:
         self._priority_keywords = priority_keywords or PRIORITY_KEYWORDS_DEFAULT
         self._memory_writer = memory_writer
         self._structured_memory = structured_memory
+        self._circuit_breaker = circuit_breaker
         # Consecutive skill failure tracking for memory hooks
         self._skill_fail_streak: Dict[str, int] = {}  # skill_name -> consecutive failures
         # Compilation flush state
@@ -333,6 +335,13 @@ class ActionExecutor:
         if not self._call_skill:
             return ActionResult("act", f"would call {skill} (no executor)")
 
+        # Circuit breaker check — skip if circuit is open for this peer+skill
+        peer_id = envelope.get("from_node", "") or envelope.get("peer_node_id", "")
+        if self._circuit_breaker and peer_id and self._circuit_breaker.is_open(peer_id, skill):
+            logger.info(f"CIRCUIT_SKIP peer={peer_id[:16]} skill={skill}")
+            return ActionResult("act_skipped",
+                                f"circuit open for peer={peer_id[:16]} skill={skill}")
+
         # Build skill input from config template + envelope
         input_template = actions_cfg.get("input", {})
         skill_input = {}
@@ -364,6 +373,9 @@ class ActionExecutor:
 
             if is_error:
                 logger.warning(f"SKILL_ERROR {skill}: {error_msg}")
+                # Circuit breaker: record failure for this peer+skill
+                if self._circuit_breaker and peer_id:
+                    self._circuit_breaker.record_failure(peer_id, skill)
                 # Track consecutive failures for memory hook
                 self._skill_fail_streak[skill] = self._skill_fail_streak.get(skill, 0) + 1
                 if self._memory_writer and self._skill_fail_streak[skill] >= 3:
@@ -395,8 +407,10 @@ class ActionExecutor:
                 return ActionResult("act_error",
                                     f"skill={skill} error={_truncate(error_msg, 200)}")
 
-            # Success — reset failure streak and record in memory
+            # Success — reset failure streak and circuit breaker
             self._skill_fail_streak.pop(skill, None)
+            if self._circuit_breaker and peer_id:
+                self._circuit_breaker.record_success(peer_id, skill)
             # Resolve peer: skill_input > envelope > result
             peer = (skill_input.get("peer_node_id", "")
                     or envelope.get("from_node", "")
@@ -484,7 +498,7 @@ class ActionExecutor:
                 result = await self._call_skill("knarr-mail", {
                     "action": "wm_approve", "document_id": doc_id})
             else:
-                result = commerce.approve_quarantine(doc_id)
+                result = await commerce.approve_quarantine(doc_id)
             logger.info(f"WM_APPROVE doc={doc_id[:16]} result={result}")
             return ActionResult("wm_approve", f"approved {doc_id[:16]}")
         except Exception as e:
@@ -511,7 +525,7 @@ class ActionExecutor:
                 result = await self._call_skill("knarr-mail", {
                     "action": "wm_reject", "document_id": doc_id, "reason": reason})
             else:
-                result = commerce.reject_quarantine(doc_id, reason)
+                result = await commerce.reject_quarantine(doc_id, reason)
             logger.info(f"WM_REJECT doc={doc_id[:16]} reason={reason[:80]}")
             return ActionResult("wm_reject", f"rejected {doc_id[:16]}: {reason[:80]}")
         except Exception as e:

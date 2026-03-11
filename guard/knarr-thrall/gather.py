@@ -115,10 +115,10 @@ def _fetch_source_status(commerce) -> dict:
 
 
 def _fetch_source_economy(commerce) -> dict:
-    """GET /api/economy — returns raw JSON."""
+    """GET /api/economy — returns raw JSON. Called from asyncio.to_thread."""
     if not commerce:
         return {"error": "no commerce module"}
-    return commerce.get_economy() or {}
+    return commerce._get_sync("/api/economy") or {}
 
 
 def _fetch_source_wallet(wallet) -> dict:
@@ -619,18 +619,17 @@ class ContextGatherer:
         if not endpoint:
             return {"error": "no endpoint specified"}
 
+        # _fetch_cockpit runs inside asyncio.to_thread() — use sync HTTP
         if endpoint == "/api/economy":
-            return self._commerce.get_economy()
+            return self._commerce._get_sync("/api/economy")
         elif endpoint == "/api/ledger":
-            return self._commerce.query_ledger()
-        elif endpoint == "/api/positions":
-            threshold = float(cfg.get("threshold", "0.8"))
-            return self._commerce.check_positions(threshold)
+            result = self._commerce._get_sync("/api/ledger")
+            return result if isinstance(result, list) else []
         elif endpoint.startswith("/api/receipts/"):
             ref = endpoint.split("/")[-1]
-            return self._commerce.query_receipt(ref)
+            return self._commerce._get_sync(f"/api/receipts/{ref}")
         else:
-            return self._commerce._get(endpoint)
+            return self._commerce._get_sync(endpoint)
 
     def _fetch_memory(self, cfg: dict) -> Any:
         """Query thrall structured memory."""

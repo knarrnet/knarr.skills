@@ -103,6 +103,19 @@ class ThrallDB:
             CREATE INDEX IF NOT EXISTS idx_memory_ts ON thrall_memory(timestamp);
         """)
 
+        # Circuit breaker state (v3.9 T2)
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS thrall_circuit_breaker (
+                peer_id     TEXT NOT NULL,
+                operation   TEXT NOT NULL,
+                consecutive_failures INTEGER DEFAULT 0,
+                last_failure_at     REAL,
+                backoff_until       REAL,
+                backoff_level       INTEGER DEFAULT 0,
+                PRIMARY KEY (peer_id, operation)
+            );
+        """)
+
         # Migration: add from_node column for fast rate-limit / cache queries
         try:
             c.execute("ALTER TABLE thrall_journal ADD COLUMN from_node TEXT DEFAULT ''")
@@ -389,6 +402,42 @@ class ThrallDB:
                 d["metadata"] = {}
             result.append(d)
         return result
+
+    # ── Circuit Breaker ──
+
+    def get_circuit(self, peer_id: str, operation: str) -> Optional[dict]:
+        """Get circuit breaker state for a peer+operation."""
+        row = self._conn.execute(
+            "SELECT * FROM thrall_circuit_breaker WHERE peer_id=? AND operation=?",
+            (peer_id[:16], operation)).fetchone()
+        return dict(row) if row else None
+
+    def upsert_circuit(self, peer_id: str, operation: str,
+                       consecutive_failures: int, last_failure_at: float,
+                       backoff_until: float, backoff_level: int):
+        """Insert or update circuit breaker state."""
+        self._conn.execute("""
+            INSERT OR REPLACE INTO thrall_circuit_breaker
+                (peer_id, operation, consecutive_failures, last_failure_at,
+                 backoff_until, backoff_level)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (peer_id[:16], operation, consecutive_failures,
+              last_failure_at, backoff_until, backoff_level))
+        self._conn.commit()
+
+    def reset_circuit(self, peer_id: str, operation: str):
+        """Reset circuit to closed (success resets failures)."""
+        self._conn.execute(
+            "DELETE FROM thrall_circuit_breaker WHERE peer_id=? AND operation=?",
+            (peer_id[:16], operation))
+        self._conn.commit()
+
+    def get_all_circuits(self) -> List[dict]:
+        """Get all circuit breaker entries (diagnostics)."""
+        rows = self._conn.execute(
+            "SELECT * FROM thrall_circuit_breaker ORDER BY backoff_until DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── Stats ──
 

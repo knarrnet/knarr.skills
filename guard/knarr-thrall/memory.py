@@ -109,6 +109,105 @@ class ThrallMemory:
         return "\n".join(lines)
 
 
+# ── Circuit Breaker ──────────────────────────────────────────────────
+
+
+class CircuitBreaker:
+    """Per-peer, per-operation circuit breaker with exponential backoff.
+
+    States: CLOSED (normal) → OPEN (skip peer) → HALF_OPEN (probe).
+    Persists to SQLite via ThrallDB.
+
+    Config defaults:
+        failure_threshold = 3
+        backoff_seconds = 3600   (1h, doubles each level)
+        max_backoff_seconds = 86400  (24h cap)
+    """
+
+    def __init__(self, db: ThrallDB, config: dict = None):
+        self._db = db
+        cfg = config or {}
+        self._threshold = int(cfg.get("failure_threshold", 3))
+        self._base_backoff = float(cfg.get("backoff_seconds", 3600))
+        self._max_backoff = float(cfg.get("max_backoff_seconds", 86400))
+
+    def is_open(self, peer_id: str, operation: str) -> bool:
+        """True if circuit is open (peer should be skipped).
+
+        Returns False (allow) if: no record, below threshold, or backoff expired
+        (half-open — allows one probe attempt).
+        """
+        row = self._db.get_circuit(peer_id, operation)
+        if not row:
+            return False
+        if row["consecutive_failures"] < self._threshold:
+            return False
+        # Circuit is open — check if backoff has expired (half-open)
+        if row["backoff_until"] and time.time() >= row["backoff_until"]:
+            return False  # half-open: allow one probe
+        return True
+
+    def record_failure(self, peer_id: str, operation: str) -> None:
+        """Increment failure count. Opens circuit at threshold."""
+        row = self._db.get_circuit(peer_id, operation)
+        now = time.time()
+
+        if row:
+            failures = row["consecutive_failures"] + 1
+            level = row.get("backoff_level", 0)
+        else:
+            failures = 1
+            level = 0
+
+        # Calculate backoff if at or above threshold
+        backoff_until = 0.0
+        if failures >= self._threshold:
+            backoff_secs = min(
+                self._base_backoff * (2 ** level),
+                self._max_backoff)
+            backoff_until = now + backoff_secs
+            level += 1
+            logger.info(
+                f"CIRCUIT_OPEN peer={peer_id[:16]} op={operation} "
+                f"failures={failures} backoff={backoff_secs:.0f}s "
+                f"until={time.strftime('%H:%M', time.gmtime(backoff_until))}")
+
+        self._db.upsert_circuit(
+            peer_id, operation, failures, now, backoff_until, level)
+
+    def record_success(self, peer_id: str, operation: str) -> None:
+        """Reset failure count. Closes circuit."""
+        row = self._db.get_circuit(peer_id, operation)
+        if row:
+            if row["consecutive_failures"] >= self._threshold:
+                logger.info(
+                    f"CIRCUIT_CLOSED peer={peer_id[:16]} op={operation} "
+                    f"(was open with {row['consecutive_failures']} failures)")
+            self._db.reset_circuit(peer_id, operation)
+
+    def get_status(self, peer_id: str, operation: str) -> dict:
+        """Return circuit state for diagnostics."""
+        row = self._db.get_circuit(peer_id, operation)
+        if not row:
+            return {"state": "closed", "failures": 0, "backoff_until": None}
+
+        now = time.time()
+        failures = row["consecutive_failures"]
+        if failures < self._threshold:
+            state = "closed"
+        elif row["backoff_until"] and now >= row["backoff_until"]:
+            state = "half_open"
+        else:
+            state = "open"
+
+        return {
+            "state": state,
+            "failures": failures,
+            "backoff_until": row["backoff_until"],
+            "backoff_level": row.get("backoff_level", 0),
+        }
+
+
 # ── Living Memory Pillar Writer ──────────────────────────────────────
 
 class MemoryWriter:
