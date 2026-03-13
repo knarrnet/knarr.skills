@@ -260,8 +260,15 @@ class ThrallPlugin(PluginHooks):
         if msg_type in ignore_types:
             return
 
-        # Build envelope
+        # Drop messages with no sender and no body — these are protocol
+        # artifacts (heartbeat echoes, empty event notifications) that have
+        # no content to act on. Letting them through creates empty wakes
+        # that flood the inbox with meaningless thrall_digest system mails.
         body_text = _extract_body_text(body)
+        if not from_node and not body_text.strip():
+            if self._debug:
+                self._log.debug("Dropping empty message (no sender, no body)")
+            return
         envelope = Envelope(
             trigger_type="on_mail",
             timestamp=time.time(),
