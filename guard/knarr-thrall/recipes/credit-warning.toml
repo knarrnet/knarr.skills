@@ -13,7 +13,7 @@ cooldown_seconds = 600
 
 [evaluate]
 type = "hotwire"
-default_action = "compile"
+default_action = "drop"   # credit.change fires every tick — silence routine noise, only act on specific events
 
 [[evaluate.rules]]
 field = "limit_type"
