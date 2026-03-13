@@ -160,11 +160,14 @@ class ThrallPlugin(PluginHooks):
             db=self.db, plugin_dir=self._plugin_dir)
 
         # Initialize engine (with gatherer for [[gather]] recipe stages)
+        # T6: ctx + memory wired for pipeline error bus events and structured records
         self.engine = PipelineEngine(
             db=self.db,
             evaluator=self.evaluator,
             action_executor=self.actions,
             gatherer=self.gatherer,
+            ctx=ctx,
+            memory=self.memory,
         )
 
         # Set trust tiers

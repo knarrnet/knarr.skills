@@ -76,11 +76,14 @@ class PipelineEngine:
     """Executes recipes against envelopes. Stateless except for DB writes."""
 
     def __init__(self, db: ThrallDB, evaluator: Any = None,
-                 action_executor: Any = None, gatherer: Any = None):
+                 action_executor: Any = None, gatherer: Any = None,
+                 ctx: Any = None, memory: Any = None):
         self.db = db
         self._evaluator = evaluator
         self._action_executor = action_executor
         self._gatherer = gatherer  # ContextGatherer for pre-prompt data
+        self._ctx = ctx            # PluginContext — for bus emit_event (T6)
+        self._memory = memory      # ThrallMemory — for structured error records (T6)
         self._recipes: Dict[str, dict] = {}
         self._trust_tiers: Dict[str, str] = {}  # node_prefix → tier
 
@@ -182,6 +185,31 @@ class PipelineEngine:
                         envelope.fields[f"gather.{k}"] = json.dumps(v)
             except Exception as e:
                 logger.warning(f"[{recipe_name}] GATHER failed: {e}")
+                # T6: Emit bus event on gather-stage failure
+                try:
+                    if self._ctx and getattr(self._ctx, "emit_event", None):
+                        self._ctx.emit_event("thrall.pipeline.failed", {
+                            "recipe": recipe_name,
+                            "stage": "gather",
+                            "error": str(e),
+                            "peer": envelope.fields.get("from_node", ""),
+                        })
+                except Exception:
+                    pass  # bus emit must never crash the engine
+                # T6: Record in structured memory for T2 circuit breaker
+                # T2 queries: SELECT * FROM thrall_memory WHERE skill='thrall-pipeline'
+                #             AND outcome='error' AND node_id=<peer_id>
+                try:
+                    if self._memory:
+                        self._memory.record(
+                            skill="thrall-pipeline",
+                            outcome="error",
+                            node_id=envelope.fields.get("from_node", ""),
+                            metadata={"recipe": recipe_name, "stage": "gather",
+                                      "error": str(e)},
+                        )
+                except Exception:
+                    pass
 
         # ── EVALUATE ──
         from_node = envelope.get("from_node", "")
@@ -386,6 +414,31 @@ class PipelineEngine:
             wall_ms = int((time.time() - start) * 1000)
             fallback = eval_cfg.get("fallback_action", "log")
             logger.error(f"LLM eval failed: {e}")
+            # T6: Emit bus event on evaluate-stage failure
+            try:
+                if self._ctx and getattr(self._ctx, "emit_event", None):
+                    self._ctx.emit_event("thrall.pipeline.failed", {
+                        "recipe": prompt_name,
+                        "stage": "evaluate",
+                        "error": str(e),
+                        "peer": envelope.fields.get("from_node", ""),
+                    })
+            except Exception:
+                pass  # bus emit must never crash the engine
+            # T6: Record in structured memory for T2 circuit breaker
+            # T2 queries: SELECT * FROM thrall_memory WHERE skill='thrall-pipeline'
+            #             AND outcome='error' AND node_id=<peer_id>
+            try:
+                if self._memory:
+                    self._memory.record(
+                        skill="thrall-pipeline",
+                        outcome="error",
+                        node_id=envelope.fields.get("from_node", ""),
+                        metadata={"recipe": prompt_name, "stage": "evaluate",
+                                  "error": str(e)},
+                    )
+            except Exception:
+                pass
             return EvalResult("llm_error", fallback, str(e), "", wall_ms)
 
     # ── Action stage ──
@@ -406,6 +459,31 @@ class PipelineEngine:
             )
         except Exception as e:
             logger.error(f"Action failed: {e}")
+            # T6: Emit bus event on action-stage failure
+            try:
+                if self._ctx and getattr(self._ctx, "emit_event", None):
+                    self._ctx.emit_event("thrall.pipeline.failed", {
+                        "recipe": recipe.get("name", "unknown"),
+                        "stage": "action",
+                        "error": str(e),
+                        "peer": envelope.fields.get("from_node", ""),
+                    })
+            except Exception:
+                pass  # bus emit must never crash the engine
+            # T6: Record in structured memory for T2 circuit breaker
+            # T2 queries: SELECT * FROM thrall_memory WHERE skill='thrall-pipeline'
+            #             AND outcome='error' AND node_id=<peer_id>
+            try:
+                if self._memory:
+                    self._memory.record(
+                        skill="thrall-pipeline",
+                        outcome="error",
+                        node_id=envelope.fields.get("from_node", ""),
+                        metadata={"recipe": recipe.get("name", "unknown"),
+                                  "stage": "action", "error": str(e)},
+                    )
+            except Exception:
+                pass
             return ActionResult(eval_result.action, f"error: {e}")
 
     # ── Journal ──
