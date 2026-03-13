@@ -23,6 +23,8 @@ Sources (legacy):
     punchhole — Direct in-process read from punchhole-backend private cache
     memory    — Query thrall structured memory
     static    — Literal values
+    peers     — GET /api/peers with optional filter/fields/limit
+    receipts  — ctx.query_receipts() with optional peer/since/limit
 """
 
 import asyncio
@@ -575,8 +577,8 @@ class ContextGatherer:
         results = {}
         t0 = time.time()
 
-        # Sources that do sync HTTP and must be offloaded to a thread
-        _IO_SOURCES = {"cockpit", "commerce", "http"}
+        # Sources that do sync HTTP / blocking I/O and must run in a thread
+        _IO_SOURCES = {"cockpit", "commerce", "http", "peers", "receipts"}
 
         for cfg in gather_configs:
             name = cfg.get("name", "")
@@ -617,8 +619,116 @@ class ContextGatherer:
             return self._fetch_memory(resolved)
         elif source == "static":
             return resolved.get("value", "")
+        elif source == "peers":
+            return self._fetch_peers(resolved)
+        elif source == "receipts":
+            return self._fetch_receipts(resolved)
         else:
             raise ValueError(f"Unknown gather source: {source}")
+
+    def _fetch_peers(self, cfg: dict) -> List[dict]:
+        """Fetch peer list from GET /api/peers with optional filtering.
+
+        Params (from resolved cfg):
+            filter  — "connected" (default), "stale", or "all"
+            fields  — list of field names to project (optional)
+            limit   — integer cap on results (optional)
+
+        Runs inside asyncio.to_thread() — uses sync commerce HTTP.
+        """
+        if not self._commerce:
+            logger.debug("PEERS no commerce module — returning []")
+            return []
+
+        raw = self._commerce._get_sync("/api/peers") or {}
+        peers: List[dict] = raw if isinstance(raw, list) else raw.get("peers", [])
+
+        # Apply filter
+        peer_filter = cfg.get("filter", "connected")
+        if peer_filter == "connected":
+            peers = [p for p in peers if p.get("connected", False)]
+        elif peer_filter == "stale":
+            peers = [p for p in peers if not p.get("connected", False)]
+        # "all" — no filter
+
+        # Project fields if requested
+        fields = cfg.get("fields")
+        if fields and isinstance(fields, list):
+            peers = [{k: p[k] for k in fields if k in p} for p in peers]
+
+        # Cap at limit
+        limit = cfg.get("limit")
+        if limit is not None:
+            try:
+                peers = peers[:int(limit)]
+            except (ValueError, TypeError):
+                pass
+
+        logger.debug(f"PEERS fetched {len(peers)} peers (filter={peer_filter})")
+        return peers
+
+    def _fetch_receipts(self, cfg: dict) -> List[dict]:
+        """Fetch receipts via ctx.query_receipts() with optional filtering.
+
+        Params (from resolved cfg):
+            peer   — node_id prefix/full to filter by (optional)
+            since  — time window string: "Nh" for N hours, "Nm" for N minutes (optional)
+            limit  — integer cap on results (optional)
+
+        Requires ctx.query_receipts() — degrades gracefully to [] if unavailable.
+        Runs inside asyncio.to_thread() — query_receipts is assumed synchronous.
+        """
+        if self._ctx is None:
+            logger.debug("RECEIPTS no ctx — returning []")
+            return []
+
+        query_receipts = getattr(self._ctx, "query_receipts", None)
+        if query_receipts is None:
+            logger.debug("RECEIPTS ctx.query_receipts not available — returning []")
+            return []
+
+        # Parse since → cutoff timestamp
+        since_str = cfg.get("since", "")
+        cutoff: Optional[float] = None
+        if since_str:
+            m = re.match(r"^(\d+(?:\.\d+)?)\s*([hm])$", since_str.strip())
+            if m:
+                amount = float(m.group(1))
+                unit = m.group(2)
+                seconds = amount * 3600 if unit == "h" else amount * 60
+                cutoff = time.time() - seconds
+            else:
+                logger.warning(f"RECEIPTS unrecognised since format: {since_str!r}")
+
+        try:
+            receipts: List[dict] = query_receipts() or []
+        except Exception as e:
+            logger.warning(f"RECEIPTS query_receipts() failed: {e}")
+            return []
+
+        # Apply since filter
+        if cutoff is not None:
+            receipts = [r for r in receipts
+                        if float(r.get("timestamp", 0)) >= cutoff]
+
+        # Apply peer filter
+        peer = cfg.get("peer", "")
+        if peer:
+            receipts = [r for r in receipts
+                        if r.get("peer_id", r.get("node_id", "")).startswith(peer)
+                        or r.get("from_node", "").startswith(peer)]
+
+        # Cap at limit
+        limit = cfg.get("limit")
+        if limit is not None:
+            try:
+                receipts = receipts[:int(limit)]
+            except (ValueError, TypeError):
+                pass
+
+        logger.debug(f"RECEIPTS fetched {len(receipts)} receipts "
+                     f"(peer={peer or 'any'}, since={since_str or 'all'})")
+        return receipts
 
     def _gather_punchhole(self, object_key: str) -> dict:
         """Read a private cache object directly from the punchhole backend.
