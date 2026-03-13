@@ -19,9 +19,10 @@ Sources (catalog):
     probe    — computed, no API call (probe_entropy, probe_unique_peers)
 
 Sources (legacy):
-    cockpit  — HTTP GET to cockpit API
-    memory   — Query thrall structured memory
-    static   — Literal values
+    cockpit   — HTTP GET to cockpit API
+    punchhole — Direct in-process read from punchhole-backend private cache
+    memory    — Query thrall structured memory
+    static    — Literal values
 """
 
 import asyncio
@@ -448,13 +449,14 @@ class ContextGatherer:
     """
 
     def __init__(self, commerce=None, memory=None, db=None,
-                 wallet=None, plugin_dir=None):
+                 wallet=None, plugin_dir=None, ctx=None):
         self._commerce = commerce
         self._memory = memory
         self._db = db
         self._wallet = wallet
         self._plugin_dir = plugin_dir
         self._catalog = None
+        self._ctx = ctx
 
     @property
     def catalog(self) -> Dict[str, dict]:
@@ -476,6 +478,9 @@ class ContextGatherer:
 
     def set_db(self, db):
         self._db = db
+
+    def set_ctx(self, ctx):
+        self._ctx = ctx
 
     # ── Catalog-based gather (v3.7) ─────────────────────────────────
 
@@ -603,12 +608,52 @@ class ContextGatherer:
 
         if source == "cockpit":
             return self._fetch_cockpit(resolved)
+        elif source == "punchhole":
+            object_key = resolved.get("object", "")
+            if not object_key:
+                raise ValueError("punchhole source requires 'object' field")
+            return self._gather_punchhole(object_key)
         elif source == "memory":
             return self._fetch_memory(resolved)
         elif source == "static":
             return resolved.get("value", "")
         else:
             raise ValueError(f"Unknown gather source: {source}")
+
+    def _gather_punchhole(self, object_key: str) -> dict:
+        """Read a private cache object directly from the punchhole backend.
+
+        Calls get_private_object(key) on the punchhole-backend plugin instance
+        via PluginContext.get_plugin(). This is a direct in-process memory read
+        — no HTTP, no serialization, sub-millisecond latency.
+
+        Gracefully degrades to {} when punchhole-backend is not loaded.
+
+        Returns the data payload from the signed cache object. Private objects
+        are stored as {"data": {...}, ...} — we unwrap and return data.
+        """
+        if self._ctx is None:
+            logger.debug("PUNCHHOLE no ctx — skipping (ctx not wired)")
+            return {}
+        get_plugin = getattr(self._ctx, "get_plugin", None)
+        if get_plugin is None:
+            logger.debug("PUNCHHOLE ctx.get_plugin not available — skipping")
+            return {}
+        backend = get_plugin("punchhole-backend")
+        if backend is None:
+            logger.debug(f"PUNCHHOLE backend not loaded — returning empty for {object_key}")
+            return {}
+        try:
+            obj = backend.get_private_object(object_key)
+            if obj is None:
+                logger.debug(f"PUNCHHOLE {object_key} not in cache — returning empty")
+                return {}
+            # Signed cache objects wrap payload in a "data" key; fall back to
+            # returning the whole object if there is no "data" key.
+            return obj.get("data", obj)
+        except Exception as e:
+            logger.warning(f"PUNCHHOLE get_private_object({object_key}) failed: {e}")
+            return {}
 
     def _fetch_cockpit(self, cfg: dict) -> Any:
         """Fetch data from cockpit API."""

@@ -203,13 +203,15 @@ class ThrallPlugin(PluginHooks):
             query_receipts_fn=getattr(ctx, "query_receipts", None),
         ) if self.identity.enabled else None
 
-        # Wire commerce, wallet, memory into action executor and gatherer
+        # Wire commerce, wallet, memory, ctx into action executor and gatherer
         if self.commerce:
             self.actions._commerce = self.commerce
             self.gatherer.set_commerce(self.commerce)
         if self.wallet:
             self.gatherer.set_wallet(self.wallet)
         self.gatherer.set_memory(self.memory)
+        # Wire PluginContext so punchhole gather source can call get_plugin()
+        self.gatherer.set_ctx(ctx)
 
         # Compilation config
         compile_cfg = config.get("compilation", {})
@@ -574,7 +576,7 @@ class ThrallPlugin(PluginHooks):
         while self._enabled:
             try:
                 event = await self._bus_sub.next()
-                event_name = event.get("event_type", event.get("type", "unknown"))
+                event_name = event.get("event", event.get("event_type", event.get("type", "unknown")))
 
                 # Hard rate-limit gate — drop before pipeline
                 if not self._bus_rate_check(event_name):
@@ -590,7 +592,7 @@ class ThrallPlugin(PluginHooks):
                     fields={
                         "event_name": event_name,
                         **{k: str(v) for k, v in event.items()
-                           if k not in ("event_type", "type")},
+                           if k not in ("event", "event_type", "type")},
                     },
                 )
 
