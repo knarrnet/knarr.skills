@@ -111,14 +111,14 @@ def _expand_field_names(names: List[str], catalog: Dict[str, dict]) -> List[str]
 # ── Source fetchers ──────────────────────────────────────────────────────
 
 def _fetch_source_status(commerce) -> dict:
-    """GET /api/status — returns raw JSON."""
+    """GET /api/status — returns raw JSON. Uses _get_sync (called from thread)."""
     if not commerce:
         return {"error": "no commerce module"}
-    return commerce._get("/api/status") or {}
+    return commerce._get_sync("/api/status") or {}
 
 
 def _fetch_source_economy(commerce) -> dict:
-    """GET /api/economy — returns raw JSON. Called from asyncio.to_thread."""
+    """GET /api/economy — returns raw JSON. Uses _get_sync (called from thread)."""
     if not commerce:
         return {"error": "no commerce module"}
     return commerce._get_sync("/api/economy") or {}
@@ -132,10 +132,10 @@ def _fetch_source_wallet(wallet) -> dict:
 
 
 def _fetch_source_peers(commerce) -> dict:
-    """GET /api/peers — returns raw JSON."""
+    """GET /api/peers — returns raw JSON. Uses _get_sync (called from thread)."""
     if not commerce:
         return {"error": "no commerce module"}
-    return commerce._get("/api/peers") or {}
+    return commerce._get_sync("/api/peers") or {}
 
 
 def _fetch_source_journal(db, hours: int = 24) -> dict:
@@ -511,22 +511,45 @@ class ContextGatherer:
             source = meta["cost"]
             by_source.setdefault(source, []).append(name)
 
-        # Fetch each source once
+        # Fetch each source once.
+        # I/O sources (status, economy, peers) call commerce._get_sync() which
+        # blocks. gather_fields() runs on the asyncio event loop; a blocking HTTP
+        # call here deadlocks because the cockpit handler (in the same loop) can
+        # never process the request. Fix: run I/O sources in a thread pool so the
+        # event loop stays free to handle the cockpit response.
+        import concurrent.futures as _cf
+        _IO_SOURCES = {"status", "economy", "peers"}
         source_data: Dict[str, dict] = {}
         t0 = time.time()
 
-        for source, fields in by_source.items():
+        io_sources = {s: f for s, f in by_source.items() if s in _IO_SOURCES}
+        sync_sources = {s: f for s, f in by_source.items() if s not in _IO_SOURCES}
+
+        # Run I/O-bound sources in parallel threads
+        if io_sources:
+            with _cf.ThreadPoolExecutor(max_workers=len(io_sources)) as _ex:
+                _futs = {}
+                for source in io_sources:
+                    if source == "status":
+                        _futs[source] = _ex.submit(_fetch_source_status, self._commerce)
+                    elif source == "economy":
+                        _futs[source] = _ex.submit(_fetch_source_economy, self._commerce)
+                    elif source == "peers":
+                        _futs[source] = _ex.submit(_fetch_source_peers, self._commerce)
+                for source, fut in _futs.items():
+                    try:
+                        source_data[source] = fut.result(timeout=12)
+                    except Exception as e:
+                        logger.warning(f"GATHER_FIELDS source {source} failed: {e}")
+                        source_data[source] = {"error": str(e)}
+
+        # Run non-I/O sources synchronously
+        for source, fields in sync_sources.items():
             try:
-                if source == "status":
-                    source_data[source] = _fetch_source_status(self._commerce)
-                elif source == "economy":
-                    source_data[source] = _fetch_source_economy(self._commerce)
-                elif source == "wallet":
+                if source == "wallet":
                     source_data[source] = _fetch_source_wallet(self._wallet)
                 elif source == "journal":
                     source_data[source] = _fetch_source_journal(self._db)
-                elif source == "peers":
-                    source_data[source] = _fetch_source_peers(self._commerce)
                 elif source == "memory":
                     source_data[source] = _fetch_source_memory(self._db)
                 elif source == "none":
