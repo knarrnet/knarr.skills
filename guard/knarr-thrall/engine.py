@@ -5,6 +5,7 @@ Each stage is a pure function that takes an envelope and recipe config.
 The engine orchestrates the flow and writes to the journal.
 """
 
+import asyncio
 import fnmatch
 import json
 import logging
@@ -174,7 +175,7 @@ class PipelineEngine:
                 gather_cfg = recipe["gather"]
                 if isinstance(gather_cfg, list) and gather_cfg and isinstance(gather_cfg[0], str):
                     # v3.7 catalog fields: gather = ["field1", "field2"]
-                    gathered = self._gatherer.gather_fields(gather_cfg)
+                    gathered = await asyncio.to_thread(self._gatherer.gather_fields, gather_cfg)
                 else:
                     # Legacy [[gather]] blocks
                     gathered = await self._gatherer.gather(recipe, envelope)

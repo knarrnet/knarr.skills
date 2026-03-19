@@ -16,7 +16,7 @@ type = "on_event"
 event_pattern = "settlement.confirmed"
 
 [filter]
-cooldown_key = "settle-exec-{{peer_public_key}}"
+cooldown_key = "settle-exec-{{peer}}"
 cooldown_seconds = 3600
 
 [[gather]]
@@ -36,5 +36,6 @@ default_action = "execute_settlement"
 
 [actions.execute_settlement]
 skill = "settlement-execute-lite"
-input = { peer_node_id = "{{peer_node_id}}", settle_amount = "{{settle_amount}}", chain = "solana_testnet" }
+input = { peer_pubkey = "{{peer}}", settle_amount = "{{amount}}", chain = "solana_testnet" }
+timeout = 120
 error_buffer = "settlement-errors"
