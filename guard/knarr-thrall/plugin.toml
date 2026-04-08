@@ -49,6 +49,24 @@ keyfile = "thrall_identity.key"   # relative to plugin_dir
 [config.thrall.wallet]
 ceiling = 50.0                    # max credits per day
 
+[config.thrall.knowledge]
+trust_level = "none"              # none | trusted | unsafe
+storage_dir = "knowledge"         # relative to plugin dir
+max_domains = 50
+max_chunks_per_domain = 500
+max_pack_bytes = 5242880          # 5MB
+retrieval_mode = "auto"           # fts | vec | hybrid | rerank | auto
+embed_model = ""                  # ollama embedding model (e.g., "nomic-embed-text")
+embed_url = ""                    # ollama URL (default: same as backend URL)
+rrf_k = 60                        # RRF constant (higher = more weight to lower ranks)
+rerank_candidates = 20            # FTS candidates for rerank step
+wing = ""                         # identity namespace (empty = single-identity mode)
+
+# Per-domain overrides:
+# [config.thrall.knowledge.overrides.eu-compliance]
+# retrieval_mode = "hybrid"
+# trust_level = "trusted"
+
 [config.thrall.trust_tiers]
 team = []                         # 16-char hex prefix of YOUR other nodes
 known = []                        # 16-char hex prefix of trusted peers

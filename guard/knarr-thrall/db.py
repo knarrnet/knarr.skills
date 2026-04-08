@@ -124,6 +124,68 @@ class ThrallDB:
             pass  # column already exists
         c.commit()
 
+        # Knowledge-as-a-Service (v3.10)
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS thrall_knowledge (
+                id          INTEGER PRIMARY KEY,
+                domain      TEXT NOT NULL,
+                wing        TEXT NOT NULL DEFAULT '',
+                source_file TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text  TEXT NOT NULL,
+                embedding   BLOB,
+                version     TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                UNIQUE(domain, source_file, chunk_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_knowledge_domain
+                ON thrall_knowledge(domain);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_wing
+                ON thrall_knowledge(wing);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_wing_domain
+                ON thrall_knowledge(wing, domain);
+
+            CREATE TABLE IF NOT EXISTS thrall_knowledge_meta (
+                domain           TEXT PRIMARY KEY,
+                wing             TEXT NOT NULL DEFAULT '',
+                version          TEXT NOT NULL,
+                description      TEXT,
+                author_node      TEXT,
+                author_pubkey    TEXT,
+                trust_level      TEXT DEFAULT 'none',
+                acquired_at      TEXT NOT NULL,
+                file_count       INTEGER,
+                chunk_count      INTEGER,
+                ingestion_status TEXT DEFAULT 'pending',
+                embedding_model  TEXT DEFAULT '',
+                retrieval_mode   TEXT DEFAULT ''
+            );
+        """)
+
+        # FTS5 index — always created
+        try:
+            c.executescript("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS thrall_knowledge_fts
+                USING fts5(
+                    chunk_text, domain, source_file,
+                    content='thrall_knowledge', content_rowid='id'
+                );
+            """)
+        except Exception:
+            pass  # FTS5 may not be available on all builds
+
+        # Migration: add wing column to existing knowledge tables
+        for tbl, col, default in [
+            ("thrall_knowledge", "wing", "''"),
+            ("thrall_knowledge_meta", "wing", "''"),
+            ("thrall_knowledge_meta", "retrieval_mode", "''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT DEFAULT {default}")
+                c.commit()
+            except sqlite3.OperationalError:
+                pass
+
     # ── Journal ──
 
     def write_journal(self, pipeline: str, envelope: dict, filter_result: dict,
