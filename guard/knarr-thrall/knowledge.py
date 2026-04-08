@@ -87,6 +87,15 @@ def _make_chunk(text: str, source_file: str, domain: str,
     }
 
 
+def _sanitize_filename(name: str) -> str:
+    """Strip path separators and parent references from filenames."""
+    base = os.path.basename(name)
+    base = base.replace("..", "").replace("\x00", "")
+    if not base:
+        base = "unnamed"
+    return base
+
+
 # ── OllamaEmbedder ──
 
 class OllamaEmbedder:
@@ -135,6 +144,7 @@ class KnowledgeManager:
         self._db = db
         self._backend = backend
         self._plugin_dir = plugin_dir
+        self._lock = threading.Lock()
         cfg = config or {}
         self._trust_level = cfg.get("trust_level", "none")
         self._storage_dir = os.path.join(
@@ -228,6 +238,7 @@ class KnowledgeManager:
         self._validate_pack(pack)
         domain = pack["domain"]
         version = pack["version"]
+        wing = self._wing
 
         if sender_node_id and pack["metadata"]["author"] != sender_node_id:
             logger.info(
@@ -235,51 +246,57 @@ class KnowledgeManager:
                 f"author={pack['metadata']['author'][:16]} "
                 f"sender={sender_node_id[:16]}")
 
-        existing = self._db._conn.execute(
-            "SELECT version, ingestion_status FROM thrall_knowledge_meta "
-            "WHERE domain = ?", (domain,)).fetchone()
-        if existing:
-            if existing["ingestion_status"] == "ingesting":
-                return {"status": "ingesting", "domain": domain}
-            def _ver(v):
-                try: return tuple(int(x) for x in v.split("."))
-                except: return (0,)
-            if _ver(existing["version"]) == _ver(version):
-                return {"status": "exists", "domain": domain}
-            if _ver(existing["version"]) > _ver(version):
-                return {"status": "newer_exists", "domain": domain,
-                        "current_version": existing["version"]}
+        with self._lock:
+            existing = self._db._conn.execute(
+                "SELECT version, ingestion_status FROM thrall_knowledge_meta "
+                "WHERE domain = ? AND wing = ?", (domain, wing)).fetchone()
+            if existing:
+                if existing["ingestion_status"] == "ingesting":
+                    return {"status": "ingesting", "domain": domain}
+                def _ver(v):
+                    try: return tuple(int(x) for x in v.split("."))
+                    except: return (0,)
+                if _ver(existing["version"]) == _ver(version):
+                    return {"status": "exists", "domain": domain}
+                if _ver(existing["version"]) > _ver(version):
+                    return {"status": "newer_exists", "domain": domain,
+                            "current_version": existing["version"]}
 
-        count = self._db._conn.execute(
-            "SELECT COUNT(*) FROM thrall_knowledge_meta").fetchone()[0]
-        if count >= self._max_domains and not existing:
-            raise ValueError(f"Max domains ({self._max_domains}) reached.")
+            count = self._db._conn.execute(
+                "SELECT COUNT(*) FROM thrall_knowledge_meta WHERE wing = ?",
+                (wing,)).fetchone()[0]
+            if count >= self._max_domains and not existing:
+                raise ValueError(f"Max domains ({self._max_domains}) reached.")
 
-        domain_dir = os.path.join(self._storage_dir, domain)
-        os.makedirs(domain_dir, exist_ok=True)
-        for fname, content in pack["files"].items():
-            with open(os.path.join(domain_dir, fname), "w",
-                      encoding="utf-8") as f:
-                f.write(content)
-
-        if pack.get("recipe"):
-            recipe_dir = os.path.join(domain_dir, "recipes")
-            os.makedirs(recipe_dir, exist_ok=True)
-            for fname, content in pack["recipe"].items():
-                with open(os.path.join(recipe_dir, fname), "w",
+            # Save raw files with sanitized names
+            domain_dir = os.path.join(self._storage_dir,
+                                      _sanitize_filename(domain))
+            os.makedirs(domain_dir, exist_ok=True)
+            for fname, content in pack["files"].items():
+                safe_name = _sanitize_filename(fname)
+                with open(os.path.join(domain_dir, safe_name), "w",
                           encoding="utf-8") as f:
                     f.write(content)
 
-        self._db._conn.execute("""
-            INSERT OR REPLACE INTO thrall_knowledge_meta
-                (domain, wing, version, description, author_node, author_pubkey,
-                 acquired_at, file_count, chunk_count, ingestion_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'ingesting')
-        """, (domain, self._wing, version, pack["description"],
-              pack["metadata"]["author"], pack["metadata"]["author_pubkey"],
-              time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              len(pack["files"])))
-        self._db._conn.commit()
+            if pack.get("recipe"):
+                recipe_dir = os.path.join(domain_dir, "recipes")
+                os.makedirs(recipe_dir, exist_ok=True)
+                for fname, content in pack["recipe"].items():
+                    safe_name = _sanitize_filename(fname)
+                    with open(os.path.join(recipe_dir, safe_name), "w",
+                              encoding="utf-8") as f:
+                        f.write(content)
+
+            self._db._conn.execute("""
+                INSERT OR REPLACE INTO thrall_knowledge_meta
+                    (domain, wing, version, description, author_node, author_pubkey,
+                     acquired_at, file_count, chunk_count, ingestion_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'ingesting')
+            """, (domain, wing, version, pack["description"],
+                  pack["metadata"]["author"], pack["metadata"]["author_pubkey"],
+                  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  len(pack["files"])))
+            self._db._conn.commit()
 
         self._executor.submit(self._ingest_background, pack)
 
@@ -288,107 +305,132 @@ class KnowledgeManager:
 
     def _ingest_background(self, pack: dict):
         domain = pack["domain"]
+        wing = self._wing
         t0 = time.time()
-        try:
-            self._db._conn.execute(
-                "DELETE FROM thrall_knowledge WHERE domain = ?", (domain,))
+        with self._lock:
+            try:
+                # Begin explicit transaction for atomicity
+                self._db._conn.execute("BEGIN IMMEDIATE")
 
-            all_chunks = []
-            for fname, content in pack["files"].items():
-                chunks = chunk_markdown(content, fname, domain)
-                all_chunks.extend(chunks)
+                self._db._conn.execute(
+                    "DELETE FROM thrall_knowledge WHERE domain = ? AND wing = ?",
+                    (domain, wing))
 
-            if len(all_chunks) > self._max_chunks:
-                all_chunks = all_chunks[:self._max_chunks]
-                logger.warning(
-                    f"KNOWLEDGE_TRUNCATED domain={domain} "
-                    f"chunks={len(all_chunks)} max={self._max_chunks}")
+                all_chunks = []
+                for fname, content in pack["files"].items():
+                    chunks = chunk_markdown(content, _sanitize_filename(fname),
+                                            domain)
+                    all_chunks.extend(chunks)
 
-            # Batch embed if embedder available
-            embeddings = [None] * len(all_chunks)
-            if self._embedder and self._vec_available:
-                try:
-                    texts = [c["chunk_text"] for c in all_chunks]
-                    # Batch in groups of 20
-                    for b_start in range(0, len(texts), 20):
-                        batch = texts[b_start:b_start + 20]
-                        embs = self._embedder.embed_batch(batch)
-                        for j, emb in enumerate(embs):
-                            embeddings[b_start + j] = emb
-                except Exception as e:
-                    logger.warning(f"Batch embed failed: {e}")
+                if len(all_chunks) > self._max_chunks:
+                    all_chunks = all_chunks[:self._max_chunks]
+                    logger.warning(
+                        f"KNOWLEDGE_TRUNCATED domain={domain} "
+                        f"chunks={len(all_chunks)} max={self._max_chunks}")
 
-            for i, chunk in enumerate(all_chunks):
-                blob = None
-                if embeddings[i]:
-                    blob = struct.pack(f'{len(embeddings[i])}f', *embeddings[i])
-
-                cur = self._db._conn.execute("""
-                    INSERT OR REPLACE INTO thrall_knowledge
-                        (domain, wing, source_file, chunk_index, chunk_text,
-                         embedding, version, acquired_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (domain, self._wing, chunk["source_file"],
-                      chunk["chunk_index"], chunk["chunk_text"],
-                      blob, pack["version"],
-                      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
-
-                if embeddings[i] and self._vec_available:
+                # Batch embed if embedder available
+                embeddings = [None] * len(all_chunks)
+                has_embeddings = False
+                if self._embedder and self._vec_available:
                     try:
-                        if self._vec_dim is None:
-                            self._vec_dim = len(embeddings[i])
-                            self._db._conn.execute(f"""
-                                CREATE VIRTUAL TABLE IF NOT EXISTS
-                                thrall_knowledge_vec USING vec0(
-                                    id INTEGER PRIMARY KEY,
-                                    embedding float[{self._vec_dim}]
-                                )
-                            """)
-                        self._db._conn.execute(
-                            "INSERT INTO thrall_knowledge_vec(id, embedding) "
-                            "VALUES (?, ?)",
-                            (cur.lastrowid, blob))
+                        texts = [c["chunk_text"] for c in all_chunks]
+                        for b_start in range(0, len(texts), 20):
+                            batch = texts[b_start:b_start + 20]
+                            embs = self._embedder.embed_batch(batch)
+                            for j, emb in enumerate(embs):
+                                embeddings[b_start + j] = emb
+                                has_embeddings = True
                     except Exception as e:
-                        logger.warning(f"Vec insert failed: {e}")
+                        logger.warning(f"Batch embed failed: {e}")
 
+                for i, chunk in enumerate(all_chunks):
+                    blob = None
+                    if embeddings[i]:
+                        blob = struct.pack(
+                            f'{len(embeddings[i])}f', *embeddings[i])
+
+                    cur = self._db._conn.execute("""
+                        INSERT INTO thrall_knowledge
+                            (domain, wing, source_file, chunk_index,
+                             chunk_text, section, embedding, version,
+                             acquired_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (domain, wing, chunk["source_file"],
+                          chunk["chunk_index"], chunk["chunk_text"],
+                          chunk.get("section", ""), blob, pack["version"],
+                          time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+
+                    if embeddings[i] and self._vec_available:
+                        try:
+                            if self._vec_dim is None:
+                                self._vec_dim = len(embeddings[i])
+                                self._db._conn.execute(f"""
+                                    CREATE VIRTUAL TABLE IF NOT EXISTS
+                                    thrall_knowledge_vec USING vec0(
+                                        id INTEGER PRIMARY KEY,
+                                        embedding float[{self._vec_dim}]
+                                    )
+                                """)
+                            self._db._conn.execute(
+                                "INSERT INTO thrall_knowledge_vec"
+                                "(id, embedding) VALUES (?, ?)",
+                                (cur.lastrowid, blob))
+                        except Exception as e:
+                            logger.warning(f"Vec insert failed: {e}")
+
+                    try:
+                        self._db._conn.execute(
+                            "INSERT INTO thrall_knowledge_fts"
+                            "(rowid, chunk_text, domain, source_file) "
+                            "VALUES (?, ?, ?, ?)",
+                            (cur.lastrowid, chunk["chunk_text"],
+                             domain, chunk["source_file"]))
+                    except Exception as e:
+                        logger.warning(f"FTS5 insert failed: {e}")
+
+                # Determine effective retrieval mode based on what we stored
+                if has_embeddings:
+                    effective_mode = self._resolve_mode(domain)
+                else:
+                    effective_mode = "fts"
+
+                wall_ms = int((time.time() - t0) * 1000)
+                model_name = (self._embedder.model_name
+                              if self._embedder else "none")
+                self._db._conn.execute("""
+                    UPDATE thrall_knowledge_meta
+                    SET chunk_count = ?, ingestion_status = 'ready',
+                        embedding_model = ?, retrieval_mode = ?
+                    WHERE domain = ? AND wing = ?
+                """, (len(all_chunks), model_name,
+                      effective_mode, domain, wing))
+
+                self._db._conn.commit()
+
+                logger.info(
+                    f"KNOWLEDGE_INGESTED domain={domain} wing={wing} "
+                    f"chunks={len(all_chunks)} version={pack['version']} "
+                    f"mode={effective_mode} wall_ms={wall_ms}")
+
+                self._maybe_load_recipes(pack)
+
+            except Exception as e:
+                logger.error(
+                    f"KNOWLEDGE_INGEST_FAILED domain={domain}: {e}")
                 try:
-                    self._db._conn.execute(
-                        "INSERT INTO thrall_knowledge_fts"
-                        "(rowid, chunk_text, domain, source_file) "
-                        "VALUES (?, ?, ?, ?)",
-                        (cur.lastrowid, chunk["chunk_text"],
-                         domain, chunk["source_file"]))
-                except Exception as e:
-                    logger.warning(f"FTS5 insert failed: {e}")
-
-            self._db._conn.commit()
-
-            wall_ms = int((time.time() - t0) * 1000)
-            model_name = self._embedder.model_name if self._embedder else "none"
-            self._db._conn.execute("""
-                UPDATE thrall_knowledge_meta
-                SET chunk_count = ?, ingestion_status = 'ready',
-                    embedding_model = ?, retrieval_mode = ?
-                WHERE domain = ?
-            """, (len(all_chunks), model_name,
-                  self._resolve_mode(domain), domain))
-            self._db._conn.commit()
-
-            logger.info(
-                f"KNOWLEDGE_INGESTED domain={domain} "
-                f"chunks={len(all_chunks)} version={pack['version']} "
-                f"wall_ms={wall_ms}")
-
-            self._maybe_load_recipes(pack)
-
-        except Exception as e:
-            logger.error(f"KNOWLEDGE_INGEST_FAILED domain={domain}: {e}")
-            self._db._conn.execute("""
-                UPDATE thrall_knowledge_meta
-                SET ingestion_status = 'failed'
-                WHERE domain = ?
-            """, (domain,))
-            self._db._conn.commit()
+                    self._db._conn.rollback()
+                except Exception:
+                    pass
+                # Mark as failed without committing partial data
+                try:
+                    self._db._conn.execute("""
+                        UPDATE thrall_knowledge_meta
+                        SET ingestion_status = 'failed'
+                        WHERE domain = ? AND wing = ?
+                    """, (domain, wing))
+                    self._db._conn.commit()
+                except Exception:
+                    pass
 
     def _maybe_load_recipes(self, pack: dict):
         domain = pack["domain"]
@@ -405,72 +447,78 @@ class KnowledgeManager:
 
         Supports structural scoping: wing, domain, source_file, section.
         """
+        w = wing or self._wing
         meta = self._db._conn.execute(
             "SELECT ingestion_status, embedding_model FROM "
-            "thrall_knowledge_meta WHERE domain = ?",
-            (domain,)).fetchone()
+            "thrall_knowledge_meta WHERE domain = ? AND wing = ?",
+            (domain, w)).fetchone()
         if not meta:
             return ""
-        if meta["ingestion_status"] in ("pending", "ingesting"):
+        if meta["ingestion_status"] in ("pending", "ingesting", "failed"):
             return ""
 
-        # Build scope filter
+        # Build scope filter (always uses k. alias for thrall_knowledge)
         scope_where = "k.domain = ?"
-        scope_params = [domain]
-        if wing or self._wing:
+        scope_params: list = [domain]
+        if w:
             scope_where += " AND k.wing = ?"
-            scope_params.append(wing or self._wing)
+            scope_params.append(w)
         if source_file:
             scope_where += " AND k.source_file = ?"
             scope_params.append(source_file)
+        if section:
+            scope_where += " AND k.section = ?"
+            scope_params.append(section)
 
         mode = self._resolve_mode(domain)
         if mode == "fts":
             return self._query_fts(scope_where, scope_params,
-                                   query_text, top_k, section)
+                                   query_text, top_k)
         elif mode == "vec":
             return self._query_vec(scope_where, scope_params,
                                    query_text, top_k)
         elif mode == "hybrid":
             return self._query_rrf(scope_where, scope_params,
-                                   query_text, top_k, section)
+                                   query_text, top_k)
         elif mode == "rerank":
             return self._query_rerank(scope_where, scope_params,
-                                      query_text, top_k, section)
+                                      query_text, top_k)
         else:
             return self._query_fts(scope_where, scope_params,
-                                   query_text, top_k, section)
+                                   query_text, top_k)
 
     # ── FTS5 retrieval ──
 
-    def _query_fts(self, scope_where, scope_params,
-                   query_text, top_k, section=None):
-        keywords = self._extract_keywords(query_text, section)
+    def _query_fts(self, scope_where, scope_params, query_text, top_k):
+        keywords = self._extract_keywords(query_text)
         if not keywords:
             rows = self._db._conn.execute(f"""
-                SELECT k.id, k.chunk_text, k.source_file FROM thrall_knowledge k
+                SELECT k.id, k.chunk_text, k.source_file
+                FROM thrall_knowledge k
                 WHERE {scope_where} ORDER BY k.chunk_index LIMIT ?
             """, scope_params + [top_k]).fetchall()
         else:
             try:
+                # FTS5 JOIN: filter on k. columns, MATCH on f.chunk_text
                 rows = self._db._conn.execute(f"""
                     SELECT k.id, k.chunk_text, k.source_file
                     FROM thrall_knowledge_fts f
                     JOIN thrall_knowledge k ON f.rowid = k.id
-                    WHERE {scope_where.replace('k.', '')} AND f.chunk_text MATCH ?
+                    WHERE {scope_where} AND f.chunk_text MATCH ?
                     LIMIT ?
                 """, scope_params + [keywords, top_k]).fetchall()
             except Exception:
                 rows = self._db._conn.execute(f"""
-                    SELECT k.id, k.chunk_text, k.source_file FROM thrall_knowledge k
+                    SELECT k.id, k.chunk_text, k.source_file
+                    FROM thrall_knowledge k
                     WHERE {scope_where} ORDER BY k.chunk_index LIMIT ?
                 """, scope_params + [top_k]).fetchall()
         return self._format_chunks(rows)
 
     def _query_fts_ranked(self, scope_where, scope_params,
-                          query_text, top_k, section=None):
+                          query_text, top_k):
         """Return ordered list of (id, chunk_text) from FTS5."""
-        keywords = self._extract_keywords(query_text, section)
+        keywords = self._extract_keywords(query_text)
         if not keywords:
             return []
         try:
@@ -478,8 +526,8 @@ class KnowledgeManager:
                 SELECT k.id, k.chunk_text
                 FROM thrall_knowledge_fts f
                 JOIN thrall_knowledge k ON f.rowid = k.id
-                WHERE {scope_where.replace('k.', '')} AND f.chunk_text MATCH ?
-                ORDER BY rank LIMIT ?
+                WHERE {scope_where} AND f.chunk_text MATCH ?
+                ORDER BY f.rank LIMIT ?
             """, scope_params + [keywords, top_k]).fetchall()
             return rows
         except Exception:
@@ -487,8 +535,7 @@ class KnowledgeManager:
 
     # ── VEC retrieval ──
 
-    def _query_vec(self, scope_where, scope_params,
-                   query_text, top_k):
+    def _query_vec(self, scope_where, scope_params, query_text, top_k):
         if not self._embedder or not self._vec_available:
             return self._query_fts(scope_where, scope_params,
                                    query_text, top_k)
@@ -503,6 +550,9 @@ class KnowledgeManager:
                 ORDER BY vec_distance_cosine(v.embedding, ?)
                 LIMIT ?
             """, scope_params + [query_vec, top_k]).fetchall()
+            if not rows:
+                return self._query_fts(scope_where, scope_params,
+                                       query_text, top_k)
             return self._format_chunks(rows)
         except Exception as e:
             logger.warning(f"Vec query failed, falling back to FTS5: {e}")
@@ -531,16 +581,14 @@ class KnowledgeManager:
 
     # ── RRF hybrid retrieval ──
 
-    def _query_rrf(self, scope_where, scope_params,
-                   query_text, top_k, section=None):
+    def _query_rrf(self, scope_where, scope_params, query_text, top_k):
         """Reciprocal Rank Fusion: merge FTS + VEC ranked lists."""
         broad_k = top_k * 4
         fts_rows = self._query_fts_ranked(
-            scope_where, scope_params, query_text, broad_k, section)
+            scope_where, scope_params, query_text, broad_k)
         vec_rows = self._query_vec_ranked(
             scope_where, scope_params, query_text, broad_k)
 
-        # If one source is empty, fall back to the other
         if not fts_rows and not vec_rows:
             return ""
         if not vec_rows:
@@ -548,15 +596,15 @@ class KnowledgeManager:
         if not fts_rows:
             return self._format_chunks(vec_rows[:top_k])
 
-        # RRF scoring
+        # RRF scoring (1-based rank per standard formula)
         k = self._rrf_k
         rrf_scores = {}
         chunk_map = {}
-        for rank, row in enumerate(fts_rows):
+        for rank, row in enumerate(fts_rows, 1):
             rid = row[0] if isinstance(row, (tuple, list)) else row["id"]
             rrf_scores[rid] = rrf_scores.get(rid, 0) + 1.0 / (k + rank)
             chunk_map[rid] = row
-        for rank, row in enumerate(vec_rows):
+        for rank, row in enumerate(vec_rows, 1):
             rid = row[0] if isinstance(row, (tuple, list)) else row["id"]
             rrf_scores[rid] = rrf_scores.get(rid, 0) + 1.0 / (k + rank)
             chunk_map[rid] = row
@@ -567,12 +615,11 @@ class KnowledgeManager:
 
     # ── Rerank retrieval ──
 
-    def _query_rerank(self, scope_where, scope_params,
-                      query_text, top_k, section=None):
+    def _query_rerank(self, scope_where, scope_params, query_text, top_k):
         """FTS broad recall, reranked by embedding cosine similarity."""
         n_cand = self._rerank_candidates
         fts_rows = self._query_fts_ranked(
-            scope_where, scope_params, query_text, n_cand, section)
+            scope_where, scope_params, query_text, n_cand)
 
         if not fts_rows or not self._embedder:
             return self._format_chunks(fts_rows[:top_k])
@@ -625,53 +672,62 @@ class KnowledgeManager:
             parts.append(text)
         return "\n\n---\n\n".join(parts)
 
-    def _extract_keywords(self, text: str, section: str = None) -> str:
+    def _extract_keywords(self, text: str) -> str:
         words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
         stops = {"the", "and", "for", "are", "but", "not", "you",
                  "all", "can", "had", "her", "was", "one", "our",
                  "out", "has", "have", "this", "that", "with", "from",
                  "what", "which", "when", "where", "how", "does"}
         keywords = [w for w in words if w not in stops][:10]
-        if section:
-            sec_words = re.findall(r'\b[a-zA-Z]{3,}\b', section.lower())
-            keywords.extend(w for w in sec_words if w not in stops)
         return " OR ".join(keywords) if keywords else ""
 
     # ── Cleanup ──
 
-    def remove_domain(self, domain: str) -> dict:
+    def remove_domain(self, domain: str, wing: str = None) -> dict:
+        w = wing or self._wing
         ids = [r[0] for r in self._db._conn.execute(
-            "SELECT id FROM thrall_knowledge WHERE domain = ?",
-            (domain,)).fetchall()]
+            "SELECT id FROM thrall_knowledge WHERE domain = ? AND wing = ?",
+            (domain, w)).fetchall()]
 
-        if self._vec_available and ids:
-            try:
-                ph = ",".join("?" * len(ids))
-                self._db._conn.execute(
-                    f"DELETE FROM thrall_knowledge_vec WHERE id IN ({ph})", ids)
-            except Exception:
-                pass
+        with self._lock:
+            if self._vec_available and ids:
+                try:
+                    ph = ",".join("?" * len(ids))
+                    self._db._conn.execute(
+                        f"DELETE FROM thrall_knowledge_vec "
+                        f"WHERE id IN ({ph})", ids)
+                except Exception:
+                    pass
 
-        if ids:
-            try:
-                ph = ",".join("?" * len(ids))
-                self._db._conn.execute(
-                    f"DELETE FROM thrall_knowledge_fts WHERE rowid IN ({ph})", ids)
-            except Exception:
-                pass
+            if ids:
+                try:
+                    ph = ",".join("?" * len(ids))
+                    self._db._conn.execute(
+                        f"DELETE FROM thrall_knowledge_fts "
+                        f"WHERE rowid IN ({ph})", ids)
+                except Exception:
+                    pass
 
-        self._db._conn.execute(
-            "DELETE FROM thrall_knowledge WHERE domain = ?", (domain,))
-        self._db._conn.execute(
-            "DELETE FROM thrall_knowledge_meta WHERE domain = ?", (domain,))
-        self._db._conn.commit()
+            self._db._conn.execute(
+                "DELETE FROM thrall_knowledge "
+                "WHERE domain = ? AND wing = ?", (domain, w))
+            self._db._conn.execute(
+                "DELETE FROM thrall_knowledge_meta "
+                "WHERE domain = ? AND wing = ?", (domain, w))
+            self._db._conn.commit()
 
-        domain_dir = os.path.join(self._storage_dir, domain)
-        if os.path.isdir(domain_dir):
-            import shutil
-            shutil.rmtree(domain_dir, ignore_errors=True)
+        # Only remove files if no other wing uses this domain
+        remaining = self._db._conn.execute(
+            "SELECT COUNT(*) FROM thrall_knowledge WHERE domain = ?",
+            (domain,)).fetchone()[0]
+        if remaining == 0:
+            domain_dir = os.path.join(self._storage_dir,
+                                      _sanitize_filename(domain))
+            if os.path.isdir(domain_dir):
+                import shutil
+                shutil.rmtree(domain_dir, ignore_errors=True)
 
-        logger.info(f"KNOWLEDGE_REMOVED domain={domain}")
+        logger.info(f"KNOWLEDGE_REMOVED domain={domain} wing={w}")
         return {"status": "removed", "domain": domain}
 
     def list_domains(self) -> list:
@@ -684,6 +740,6 @@ class KnowledgeManager:
 
     def get_domain_status(self, domain: str) -> Optional[dict]:
         row = self._db._conn.execute(
-            "SELECT * FROM thrall_knowledge_meta WHERE domain = ?",
-            (domain,)).fetchone()
+            "SELECT * FROM thrall_knowledge_meta WHERE domain = ? AND wing = ?",
+            (domain, self._wing)).fetchone()
         return dict(row) if row else None

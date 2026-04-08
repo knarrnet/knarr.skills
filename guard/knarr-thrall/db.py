@@ -133,10 +133,11 @@ class ThrallDB:
                 source_file TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 chunk_text  TEXT NOT NULL,
+                section     TEXT NOT NULL DEFAULT '',
                 embedding   BLOB,
                 version     TEXT NOT NULL,
                 acquired_at TEXT NOT NULL,
-                UNIQUE(domain, source_file, chunk_index)
+                UNIQUE(wing, domain, source_file, chunk_index)
             );
             CREATE INDEX IF NOT EXISTS idx_knowledge_domain
                 ON thrall_knowledge(domain);
@@ -146,7 +147,7 @@ class ThrallDB:
                 ON thrall_knowledge(wing, domain);
 
             CREATE TABLE IF NOT EXISTS thrall_knowledge_meta (
-                domain           TEXT PRIMARY KEY,
+                domain           TEXT NOT NULL,
                 wing             TEXT NOT NULL DEFAULT '',
                 version          TEXT NOT NULL,
                 description      TEXT,
@@ -158,7 +159,8 @@ class ThrallDB:
                 chunk_count      INTEGER,
                 ingestion_status TEXT DEFAULT 'pending',
                 embedding_model  TEXT DEFAULT '',
-                retrieval_mode   TEXT DEFAULT ''
+                retrieval_mode   TEXT DEFAULT '',
+                PRIMARY KEY (wing, domain)
             );
         """)
 
@@ -174,9 +176,10 @@ class ThrallDB:
         except Exception:
             pass  # FTS5 may not be available on all builds
 
-        # Migration: add wing column to existing knowledge tables
+        # Migration: add columns to existing knowledge tables
         for tbl, col, default in [
             ("thrall_knowledge", "wing", "''"),
+            ("thrall_knowledge", "section", "''"),
             ("thrall_knowledge_meta", "wing", "''"),
             ("thrall_knowledge_meta", "retrieval_mode", "''"),
         ]:
