@@ -26,6 +26,13 @@ class Envelope:
     timestamp: float
     fields: Dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self):
+        # Inject _ts into fields so recipes can use {{envelope._ts}} for
+        # dedup-busting: cockpit async_jobs hashes input including _ts,
+        # preventing permanent 409 blocks after a failed invocation.
+        if "_ts" not in self.fields:
+            self.fields["_ts"] = str(int(self.timestamp))
+
     def get(self, key: str, default: str = "") -> str:
         return self.fields.get(key, default)
 
@@ -113,6 +120,8 @@ class PipelineEngine:
         """Find all recipes whose trigger matches this event."""
         matched = []
         for name, config in self._recipes.items():
+            if config.get("mode") == "disabled":
+                continue
             trigger = config.get("trigger", {})
             if trigger.get("type") != trigger_type:
                 continue

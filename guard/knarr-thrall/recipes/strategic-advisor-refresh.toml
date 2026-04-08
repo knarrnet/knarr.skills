@@ -30,5 +30,5 @@ action = "act"
 
 [actions.act]
 skill = "strategic-advisor-lite"
-input = { action = "reset_cooldown" }
+input = { action = "reset_cooldown", _ts = "{{envelope._ts}}" }
 error_buffer = "strategic-advisor-errors"

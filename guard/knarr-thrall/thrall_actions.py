@@ -51,7 +51,8 @@ class ActionExecutor:
                  priority_keywords: List[str] = None,
                  memory_writer=None,
                  structured_memory=None,
-                 circuit_breaker=None):
+                 circuit_breaker=None,
+                 max_payload_bytes: int = 60_000):
         self.db = db
         self._send_mail = send_mail_fn
         self._call_skill = call_skill_fn
@@ -62,6 +63,7 @@ class ActionExecutor:
         self._memory_writer = memory_writer
         self._structured_memory = structured_memory
         self._circuit_breaker = circuit_breaker
+        self._max_payload_bytes = max_payload_bytes
         # Consecutive skill failure tracking for memory hooks
         self._skill_fail_streak: Dict[str, int] = {}  # skill_name -> consecutive failures
         # Compilation flush state
@@ -356,6 +358,27 @@ class ActionExecutor:
                     skill_input[k] = v
             else:
                 skill_input[k] = v
+
+        # Payload guard: cockpit has an input body limit (default 64KB, HTTP 413).
+        # Truncate oversized string values to stay under the cap.
+        cap = self._max_payload_bytes
+        payload_size = len(json.dumps(skill_input).encode("utf-8"))
+        if payload_size > cap:
+            logger.warning(
+                f"PAYLOAD_GUARD {skill}: {payload_size}B > {cap}B, truncating")
+            for k in sorted(skill_input, key=lambda k: len(str(skill_input[k])), reverse=True):
+                v = skill_input[k]
+                if isinstance(v, str) and len(v) > 2000:
+                    skill_input[k] = v[:2000] + f"... [truncated from {len(v)} chars]"
+                    payload_size = len(json.dumps(skill_input).encode("utf-8"))
+                    if payload_size <= cap:
+                        break
+            # Hard stop: if still oversized after all truncation, do not call skill
+            if payload_size > cap:
+                logger.error(
+                    f"PAYLOAD_GUARD {skill}: still {payload_size}B after truncation, aborting")
+                return ActionResult("act_error",
+                                    f"payload {payload_size}B exceeds {cap}B limit")
 
         try:
             result = await self._call_skill(skill, skill_input)

@@ -4,6 +4,13 @@
 # This closes the settlement loop — marks the bilateral position
 # as settled in memory. The "act" action calls settlement-check-lite
 # in confirm mode to update position tracking.
+#
+# v0.50.0 NOTE (CR-01 / BCW-WM-01): When core ships the
+# payment.finalized.* → ledger credit subscriber, this recipe's
+# role shifts from "workaround credit" to "journal + observe."
+# The skill call should then be removed and the action changed
+# to "log" — thrall records the settlement for decision memory
+# but no longer needs to drive the credit write.
 
 mode = "automated"
 

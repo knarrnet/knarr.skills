@@ -38,10 +38,15 @@ def load_recipes(recipes_dir: str, db: ThrallDB) -> int:
             config["_name"] = name
             config["_source"] = str(f)
             mode = config.get("mode", "automated")
+            # Upsert ALL recipes (including disabled) so DB stays in sync
+            # with files on disk. Engine filters disabled at match time.
             db.upsert_recipe(name, config, str(f), mode)
             loaded_names.append(name)
-            logger.info(f"Recipe loaded: {name} (mode={mode})")
-            count += 1
+            if mode == "disabled":
+                logger.info(f"Recipe loaded (disabled): {name}")
+            else:
+                logger.info(f"Recipe loaded: {name} (mode={mode})")
+                count += 1
         except Exception as e:
             logger.error(f"Failed to load recipe {f.name}: {e}")
 

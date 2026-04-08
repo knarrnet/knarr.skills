@@ -8,6 +8,12 @@
 # fires fresh on the next tick.
 #
 # v3.9: Phase D — strategic guidance for small swarm nodes.
+#
+# P-003 FIX: peers.status removed from gather.
+# The skill runs on the node itself which has direct DHT access —
+# passing peers.status is redundant AND caused 64KB cockpit limit
+# overflow in 101-node networks (HTTP 413). Economy + positions
+# + skills alone give the advisor full context.
 
 mode = "automated"
 
@@ -29,11 +35,6 @@ source = "punchhole"
 object = "positions.full"
 
 [[gather]]
-name = "peers"
-source = "punchhole"
-object = "peers.status"
-
-[[gather]]
 name = "skills"
 source = "punchhole"
 object = "skills.inventory"
@@ -44,5 +45,5 @@ default_action = "act"
 
 [actions.act]
 skill = "strategic-advisor-lite"
-input = { economy = "{{envelope.gather.economy}}", positions = "{{envelope.gather.positions}}", peers = "{{envelope.gather.peers}}", skills = "{{envelope.gather.skills}}" }
+input = { economy = "{{envelope.gather.economy}}", positions = "{{envelope.gather.positions}}", skills = "{{envelope.gather.skills}}", _ts = "{{envelope._ts}}" }
 error_buffer = "strategic-advisor-errors"

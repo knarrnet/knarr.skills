@@ -141,6 +141,7 @@ class ThrallPlugin(PluginHooks):
 
         # Initialize action executor (commerce wired after identity init below)
         priority_kw = thrall_cfg.get("priority_keywords", None)
+        max_payload = int(thrall_cfg.get("max_payload_bytes", 60_000))
         self.actions = ActionExecutor(
             db=self.db,
             send_mail_fn=self._send_mail,
@@ -149,6 +150,7 @@ class ThrallPlugin(PluginHooks):
             plugin_dir=self._plugin_dir,
             priority_keywords=priority_kw,
             memory_writer=self._memory_writer,
+            max_payload_bytes=max_payload,
         )
 
         # Initialize structured memory and wire to action executor
@@ -479,7 +481,26 @@ class ThrallPlugin(PluginHooks):
             return False
 
         proposal = settle_request.get("proposal", {})
-        amount = float(proposal.get("amount", 0))
+        try:
+            amount = float(proposal.get("amount", 0))
+        except (ValueError, TypeError):
+            self._log.warning(f"INBOUND_SETTLEMENT malformed amount from {sender_pk[:16]}")
+            return False
+
+        # CR-04 SETTLE-SCHEMA: extract component fields if present
+        debt_component = proposal.get("debt_component")
+        target_balance_component = proposal.get("target_balance_component")
+        has_components = debt_component is not None and target_balance_component is not None
+        components_valid = True  # backward compat default
+        if has_components:
+            try:
+                debt_component = float(debt_component)
+                target_balance_component = float(target_balance_component)
+                components_valid = abs((debt_component + target_balance_component) - amount) < 0.01
+            except (ValueError, TypeError):
+                self._log.warning(
+                    f"INBOUND_SETTLEMENT malformed components from {sender_pk[:16]}")
+                components_valid = False
 
         envelope = Envelope(
             trigger_type="on_inbound_settlement",
@@ -489,6 +510,10 @@ class ThrallPlugin(PluginHooks):
                 "amount": str(amount),
                 "settle_request_json": json.dumps(settle_request),
                 "document_type": "settle_request",
+                "has_components": "true" if has_components else "false",
+                "debt_component": str(debt_component) if has_components else "",
+                "target_balance_component": str(target_balance_component) if has_components else "",
+                "components_valid": "true" if components_valid else "false",
             },
         )
 
