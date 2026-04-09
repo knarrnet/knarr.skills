@@ -211,13 +211,25 @@ class KnowledgeManager:
         content_size = sum(len(v.encode()) for v in pack["files"].values())
         for v in pack.get("recipe", {}).values():
             content_size += len(v.encode())
+        if pack.get("chunks"):
+            content_size += sum(len(c.get("text", "").encode())
+                                for c in pack["chunks"])
         if content_size > self._max_pack_bytes:
             raise ValueError(
                 f"Pack size {content_size} exceeds max {self._max_pack_bytes}")
 
-        canonical = json.dumps(
-            {"files": pack["files"], "recipe": pack.get("recipe", {})},
-            sort_keys=True, ensure_ascii=False)
+        hash_content = {
+            "files": pack["files"],
+            "recipe": pack.get("recipe", {}),
+        }
+        if "chunks" in pack:
+            # Pre-vectorized: include chunk texts (not embeddings) in hash
+            # Embeddings are model-dependent and may be regenerated;
+            # the text content is the authoritative signed payload
+            hash_content["chunk_texts"] = [
+                c["text"] for c in pack["chunks"]]
+        canonical = json.dumps(hash_content, sort_keys=True,
+                               ensure_ascii=False)
         computed = hashlib.sha256(canonical.encode()).hexdigest()
         if computed != meta["sha256"]:
             raise ValueError(
@@ -316,32 +328,59 @@ class KnowledgeManager:
                     "DELETE FROM thrall_knowledge WHERE domain = ? AND wing = ?",
                     (domain, wing))
 
-                all_chunks = []
-                for fname, content in pack["files"].items():
-                    chunks = chunk_markdown(content, _sanitize_filename(fname),
-                                            domain)
-                    all_chunks.extend(chunks)
+                # Pre-vectorized packs: chunks + embeddings already computed
+                # by the curator. Consumer skips chunking and embedding.
+                pre_vectorized = pack.get("chunks")
+
+                if pre_vectorized:
+                    all_chunks = []
+                    embeddings = []
+                    has_embeddings = False
+                    embed_model = pack.get("embed_model", "")
+                    for pc in pre_vectorized:
+                        all_chunks.append({
+                            "chunk_text": pc["text"],
+                            "source_file": pc.get("source_file", ""),
+                            "section": pc.get("section", ""),
+                            "chunk_index": len(all_chunks),
+                        })
+                        emb = pc.get("embedding")
+                        embeddings.append(emb)
+                        if emb:
+                            has_embeddings = True
+                    logger.info(
+                        f"KNOWLEDGE_PREVEC domain={domain} "
+                        f"chunks={len(all_chunks)} "
+                        f"has_embeddings={has_embeddings} "
+                        f"embed_model={embed_model}")
+                else:
+                    # Standard path: chunk from files, embed locally
+                    all_chunks = []
+                    for fname, content in pack["files"].items():
+                        chunks = chunk_markdown(
+                            content, _sanitize_filename(fname), domain)
+                        all_chunks.extend(chunks)
+
+                    # Batch embed if embedder available
+                    embeddings = [None] * len(all_chunks)
+                    has_embeddings = False
+                    if self._embedder and self._vec_available:
+                        try:
+                            texts = [c["chunk_text"] for c in all_chunks]
+                            for b_start in range(0, len(texts), 20):
+                                batch = texts[b_start:b_start + 20]
+                                embs = self._embedder.embed_batch(batch)
+                                for j, emb in enumerate(embs):
+                                    embeddings[b_start + j] = emb
+                                    has_embeddings = True
+                        except Exception as e:
+                            logger.warning(f"Batch embed failed: {e}")
 
                 if len(all_chunks) > self._max_chunks:
                     all_chunks = all_chunks[:self._max_chunks]
                     logger.warning(
                         f"KNOWLEDGE_TRUNCATED domain={domain} "
                         f"chunks={len(all_chunks)} max={self._max_chunks}")
-
-                # Batch embed if embedder available
-                embeddings = [None] * len(all_chunks)
-                has_embeddings = False
-                if self._embedder and self._vec_available:
-                    try:
-                        texts = [c["chunk_text"] for c in all_chunks]
-                        for b_start in range(0, len(texts), 20):
-                            batch = texts[b_start:b_start + 20]
-                            embs = self._embedder.embed_batch(batch)
-                            for j, emb in enumerate(embs):
-                                embeddings[b_start + j] = emb
-                                has_embeddings = True
-                    except Exception as e:
-                        logger.warning(f"Batch embed failed: {e}")
 
                 for i, chunk in enumerate(all_chunks):
                     blob = None
